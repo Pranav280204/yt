@@ -1,361 +1,384 @@
 import os
 import re
-import logging
-from datetime import datetime, timedelta
+import threading
+import time
+import math
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, render_template, request, redirect, url_for, flash, send_file
-import pandas as pd
-
 from googleapiclient.discovery import build
+import pandas as pd
 import psycopg
-from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-
-# === CONFIG ===
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-
-if not DATABASE_URL or not YOUTUBE_API_KEY:
-    raise RuntimeError("Set DATABASE_URL and YOUTUBE_API_KEY")
-
+# ---------------------- Config ----------------------
 IST = ZoneInfo("Asia/Kolkata")
+DATABASE_URL = os.getenv("DATABASE_URL")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY") or os.getenv("YOUTUBE_APIKEY") or os.getenv("YOUTUBE_API_KEY_V3")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("yt-tracker")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is required")
+if not YOUTUBE_API_KEY:
+    raise RuntimeError("YOUTUBE_API_KEY env var is required")
 
-# YouTube client (built once)
-youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")  # replace in prod
 
-# APScheduler (started idempotently)
-scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
-_scheduler_started = False
+# Psycopg pool with TCP keepalives for free-hosting DBs
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=5,
+    kwargs={
+        "autocommit": True,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        "options": "-c timezone=UTC",
+    },
+)
 
-# A constant for advisory lock (any 64-bit signed int). Keep stable across deploys.
-ADVISORY_LOCK_KEY = 9876543210123
+# ---------------------- DB Bootstrap ----------------------
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS video_list (
+    id SERIAL PRIMARY KEY,
+    video_id TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-# === DATABASE ===
-def get_db():
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    conn.execute("CREATE SCHEMA IF NOT EXISTS yt_tracker;")
-    conn.execute("SET search_path TO yt_tracker, public;")
-    conn.execute("SET TIME ZONE 'Asia/Kolkata';")
-    return conn
+CREATE TABLE IF NOT EXISTS views (
+    id BIGSERIAL PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES video_list(video_id) ON DELETE CASCADE,
+    ts TIMESTAMPTZ NOT NULL,
+    day DATE GENERATED ALWAYS AS (DATE(ts AT TIME ZONE 'Asia/Kolkata')) STORED,
+    views BIGINT,
+    likes BIGINT
+);
+
+-- Optional index helpers
+CREATE INDEX IF NOT EXISTS idx_views_vid_ts ON views(video_id, ts);
+CREATE INDEX IF NOT EXISTS idx_views_day ON views(day);
+"""
 
 def init_db():
-    with get_db() as conn:
+    with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS yt_tracker.video_list (
-                    video_id TEXT PRIMARY KEY,
-                    title   TEXT NOT NULL,
-                    added_at TIMESTAMPTZ DEFAULT NOW(),
-                    paused  BOOLEAN DEFAULT FALSE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS yt_tracker.views (
-                    id SERIAL PRIMARY KEY,
-                    video_id TEXT REFERENCES yt_tracker.video_list(video_id) ON DELETE CASCADE,
-                    timestamp TIMESTAMPTZ NOT NULL,
-                    date DATE NOT NULL,
-                    views BIGINT,
-                    likes BIGINT,
-                    UNIQUE(video_id, timestamp)
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS yt_tracker.meta (
-                    k TEXT PRIMARY KEY,
-                    v TEXT NOT NULL
-                );
-            """)
-            conn.commit()
-            logger.info("Database schema ready.")
+            cur.execute(SCHEMA_SQL)
 
-# === YOUTUBE ===
-def extract_video_id(url: str):
-    patterns = [
-        r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
-        r"(?:embed\/)([0-9A-Za-z_-]{11})",
-        r"(?:shorts\/)([0-9A-Za-z_-]{11})",
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
+# ---------------------- YouTube API ----------------------
+def yt_client():
+    return build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
+
+YOUTUBE_ID_RX = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+def extract_video_id(url_or_id: str) -> str | None:
+    s = url_or_id.strip()
+    if YOUTUBE_ID_RX.match(s):
+        return s
+    try:
+        u = urlparse(s)
+        if u.netloc.endswith("youtube.com"):
+            qs = parse_qs(u.query)
+            if "v" in qs and qs["v"]:
+                return qs["v"][0][:11]
+            # Short forms like /live/<id> after streams end sometimes resolve to watch?v=...
+            path_parts = [p for p in u.path.split("/") if p]
+            if path_parts and YOUTUBE_ID_RX.match(path_parts[-1]):
+                return path_parts[-1]
+        if u.netloc.endswith("youtu.be"):
+            path = u.path.strip("/")
+            if YOUTUBE_ID_RX.match(path[:11]):
+                return path[:11]
+    except Exception:
+        pass
     return None
 
 def fetch_video_stats(video_id: str):
+    """Return (title, views, likes). If API fails, return None."""
     try:
-        res = youtube.videos().list(part="statistics,snippet", id=video_id).execute()
-        if not res.get("items"):
-            return None, None, None
-        item = res["items"][0]
-        stats = item.get("statistics", {})
+        yt = yt_client()
+        resp = yt.videos().list(part="snippet,statistics", id=video_id).execute()
+        items = resp.get("items", [])
+        if not items:
+            return None
+        item = items[0]
         title = item["snippet"]["title"]
+        stats = item.get("statistics", {})
         views = int(stats.get("viewCount", 0))
         likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else None
         return title, views, likes
     except Exception as e:
-        logger.error(f"YouTube API error for {video_id}: {e}")
-        return None, None, None
+        app.logger.exception(f"YouTube API error for {video_id}: {e}")
+        return None
 
-# === SCHEDULER TICK ===
-def _aligned_5min(dt: datetime) -> datetime:
-    minute = (dt.minute // 5) * 5
-    return dt.replace(minute=minute, second=0, microsecond=0)
+# ---------------------- Advisory Lock ----------------------
+# Prevent multiple trackers across dynos. Use a constant application lock key.
+ADVISORY_LOCK_KEY = 814_220_415_337_129_001  # any 64-bit number
 
-def tick():
-    """Runs every 5 minutes. Uses an advisory lock so only one worker runs."""
-    now = datetime.now(IST)
-    ts = now.replace(second=0, microsecond=0)
-    date = ts.date()
+def try_advisory_lock(conn) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+        got = cur.fetchone()[0]
+        return got
 
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT pg_try_advisory_lock(%s);", (ADVISORY_LOCK_KEY,))
-                locked = cur.fetchone()["pg_try_advisory_lock"]
-                if not locked:
-                    logger.debug("Another worker holds the tick lock; skipping this run.")
-                    return
+# ---------------------- Background Tracker ----------------------
+stop_event = threading.Event()
+tracker_thread = None
 
-                cur.execute("SELECT video_id FROM yt_tracker.video_list WHERE NOT paused;")
-                videos = [r["video_id"] for r in cur.fetchall()]
+def seconds_to_next_5min_boundary_IST(now_utc: datetime | None = None) -> float:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(IST)
+    minute = now_ist.minute
+    next_block_min = (math.floor(minute / 5) + 1) * 5
+    # If we're exactly on boundary, don't wait (fetch now).
+    if minute % 5 == 0 and now_ist.second < 3:  # small grace to avoid double fire
+        return 0.0
+    if next_block_min >= 60:
+        next_hour = (now_ist.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+        delta = next_hour - now_ist
+    else:
+        target = now_ist.replace(minute=next_block_min, second=0, microsecond=0)
+        delta = target - now_ist
+    return max(delta.total_seconds(), 0.0)
 
-                updated = 0
-                for vid in videos:
-                    title, views, likes = fetch_video_stats(vid)
-                    if views is None:
-                        continue
-                    cur.execute("""
-                        INSERT INTO yt_tracker.views (video_id, timestamp, date, views, likes)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (video_id, timestamp) DO UPDATE
-                        SET views = EXCLUDED.views,
-                            likes = COALESCE(EXCLUDED.likes, yt_tracker.views.likes)
-                    """, (vid, ts, date, views, likes))
-                    updated += 1
+def insert_snapshot(conn, video_id: str, ts_utc: datetime, views_val: int | None, likes_val: int | None):
+    # DELETE + INSERT pattern to avoid accidental duplicates (as requested)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM views WHERE video_id=%s AND ts=%s", (video_id, ts_utc))
+        cur.execute(
+            "INSERT INTO views (video_id, ts, views, likes) VALUES (%s, %s, %s, %s)",
+            (video_id, ts_utc, views_val, likes_val),
+        )
 
-                cur.execute("""
-                    INSERT INTO yt_tracker.meta (k, v)
-                    VALUES ('last_tick_ist', %s)
-                    ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v
-                """, (ts.isoformat(),))
-            conn.commit()
-        logger.info(f"[tick] {updated} videos updated at {ts.isoformat()}")
-    except Exception as e:
-        logger.error(f"[tick] error: {e}")
-    finally:
-        try:
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT pg_advisory_unlock(%s);", (ADVISORY_LOCK_KEY,))
-                conn.commit()
-        except Exception:
-            pass
-
-def start_scheduler_once():
-    global _scheduler_started
-    if _scheduler_started:
+def poll_once(conn):
+    # Only active videos
+    with conn.cursor() as cur:
+        cur.execute("SELECT video_id FROM video_list WHERE active = TRUE ORDER BY created_at ASC")
+        videos = [r[0] for r in cur.fetchall()]
+    if not videos:
         return
-    init_db()
-    scheduler.add_job(tick, CronTrigger(minute="*/5"))
-    scheduler.start()
-    _scheduler_started = True
-    logger.info("APScheduler started: every 5 minutes.")
 
-# Start scheduler at import time (works under Gunicorn as well).
-start_scheduler_once()
-
-# === ROUTES ===
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
-        url = (request.form.get("youtube_url") or "").strip()
-        if not url:
-            flash("Enter a URL.", "error")
-            return redirect(url_for("index"))
-
-        vid = extract_video_id(url)
-        if not vid:
-            flash("Invalid YouTube URL.", "error")
-            return redirect(url_for("index"))
-
-        title, views, likes = fetch_video_stats(vid)
-        if not title:
-            flash("Video not found or private.", "error")
-            return redirect(url_for("index"))
-
+    ts_utc = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    for vid in videos:
+        stats = fetch_video_stats(vid)
+        if not stats:
+            app.logger.warning(f"Stats unavailable for {vid}; skipping this round.")
+            continue
+        title, views_val, likes_val = stats
         try:
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO yt_tracker.video_list (video_id, title, paused)
-                        VALUES (%s, %s, FALSE)
-                        ON CONFLICT (video_id) DO UPDATE SET paused = FALSE, title = EXCLUDED.title
-                    """, (vid, title))
-
-                    now_ist = datetime.now(IST)
-                    seed_ts = _aligned_5min(now_ist)
-                    cur.execute("""
-                        INSERT INTO yt_tracker.views (video_id, timestamp, date, views, likes)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (video_id, timestamp) DO UPDATE
-                        SET views = EXCLUDED.views,
-                            likes = COALESCE(EXCLUDED.likes, yt_tracker.views.likes)
-                    """, (vid, seed_ts, seed_ts.date(), views, likes))
-                conn.commit()
-            flash(f"Tracking: {title}", "success")
+            insert_snapshot(conn, vid, ts_utc, views_val, likes_val)
+            app.logger.info(f"Saved snapshot {vid} @ {ts_utc.isoformat()} views={views_val} likes={likes_val}")
         except Exception as e:
-            logger.error(f"DB error on add: {e}")
-            flash("Database error.", "error")
+            app.logger.exception(f"DB write failed for {vid}: {e}")
+
+def tracker_loop():
+    app.logger.info("Tracker thread starting...")
+    with pool.connection() as conn:
+        if not try_advisory_lock(conn):
+            app.logger.info("Another instance holds the tracker lock; this thread will idle.")
+            # Idle loop that just waits until shutdown so we don't duplicate work
+            while not stop_event.is_set():
+                time.sleep(5)
+            return
+
+        app.logger.info("Advisory lock acquired. Background tracking is active.")
+        # Align to 5-minute IST boundaries
+        while not stop_event.is_set():
+            try:
+                wait_sec = seconds_to_next_5min_boundary_IST()
+                if wait_sec > 0:
+                    stop_event.wait(wait_sec)
+                    if stop_event.is_set():
+                        break
+                # Fetch immediately on boundary
+                poll_once(conn)
+                # Small buffer to avoid double-processing within the same minute on slow hosts
+                stop_event.wait(2)
+            except Exception as e:
+                app.logger.exception(f"Tracker loop error: {e}")
+                # Avoid tight error loops
+                stop_event.wait(10)
+    app.logger.info("Tracker thread stopped.")
+
+def start_tracker_thread():
+    global tracker_thread
+    if tracker_thread and tracker_thread.is_alive():
+        return
+    tracker_thread = threading.Thread(target=tracker_loop, name="yt-tracker", daemon=True)
+    tracker_thread.start()
+
+# ---------------------- Flask Views ----------------------
+@app.before_first_request
+def bootstrap():
+    init_db()
+    # Allow disabling scheduler for worker processes if needed
+    if os.getenv("DISABLE_TRACKER", "0") != "1":
+        start_tracker_thread()
+
+@app.route("/", methods=["GET"])
+def index():
+    # Load list, and daily grouped snapshots for each video
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT video_id, title, active, created_at FROM video_list ORDER BY created_at DESC")
+        videos = cur.fetchall()
+
+        data_per_video = {}
+        for (vid, title, active, created_at) in videos:
+            cur.execute(
+                """
+                SELECT ts, views, likes
+                FROM views
+                WHERE video_id=%s
+                ORDER BY ts ASC
+                """,
+                (vid,),
+            )
+            rows = cur.fetchall()
+            # Transform to per-day blocks with gains + hourly growth
+            per_day = {}
+            last_view = None
+            # Build a rolling window for hourly growth: compare to value ~60 minutes before
+            # We'll do an O(n) pointer approach.
+            ts_list = [r[0] for r in rows]
+            view_list = [r[1] for r in rows]
+            j = 0
+            for i, (ts, v, likes) in enumerate(rows):
+                ts_ist = ts.astimezone(IST)
+                day_key = ts_ist.date().isoformat()
+
+                # gain vs last 5-min poll
+                gain_5min = None
+                if last_view is not None:
+                    gain_5min = v - last_view
+                last_view = v
+
+                # hourly growth: find oldest entry within past 60 minutes
+                cutoff = ts - timedelta(hours=1)
+                while j < i and ts_list[j] < cutoff:
+                    j += 1
+                hourly_growth = None
+                if j < i:
+                    hourly_growth = v - view_list[j]
+
+                item = {
+                    "ts": ts_ist.strftime("%Y-%m-%d %H:%M:%S"),
+                    "views": v,
+                    "likes": likes,
+                    "gain5": gain_5min,
+                    "growth60": hourly_growth,
+                }
+                per_day.setdefault(day_key, []).append(item)
+
+            data_per_video[vid] = {
+                "video_id": vid,
+                "title": title,
+                "active": active,
+                "created_at": created_at.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+                "per_day": per_day,
+            }
+
+    return render_template("index.html", videos=data_per_video)
+
+@app.route("/add", methods=["POST"])
+def add_video():
+    url = request.form.get("url", "").strip()
+    vid = extract_video_id(url)
+    if not vid:
+        flash("Invalid YouTube URL or ID.", "error")
         return redirect(url_for("index"))
 
+    stats = fetch_video_stats(vid)
+    if not stats:
+        flash("Could not fetch video details from YouTube API.", "error")
+        return redirect(url_for("index"))
+    title, views_val, likes_val = stats
+
     try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT video_id, title, paused, added_at
-                    FROM yt_tracker.video_list
-                    ORDER BY added_at DESC
-                """)
-                videos = cur.fetchall()
-                cur.execute("SELECT v FROM yt_tracker.meta WHERE k = 'last_tick_ist';")
-                row = cur.fetchone()
-                last_tick = row["v"] if row else None
-
-        video_data = []
-        for v in videos:
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT date, timestamp, views, likes
-                        FROM yt_tracker.views
-                        WHERE video_id = %s
-                        ORDER BY timestamp
-                    """, (v["video_id"],))
-                    rows = cur.fetchall()
-
-            if not rows:
-                continue
-
-            df = pd.DataFrame(rows)
-            daily_groups = df.groupby("date")
-
-            tabs = []
-            for date_key, g in daily_groups:
-                g = g.sort_values("timestamp").copy()
-                g["gain_5min"] = g["views"].diff().fillna(0).astype(int)
-
-                hourly = []
-                for _, r in g.iterrows():
-                    ago = r["timestamp"] - timedelta(minutes=60)
-                    past = g[g["timestamp"] <= ago]
-                    gain = r["views"] - past.iloc[-1]["views"] if not past.empty else 0
-                    hourly.append(gain)
-                g["hourly_rate"] = hourly
-
-                g["time_str"] = g["timestamp"].dt.strftime("%H:%M")
-                g["views_str"] = g["views"].apply(lambda x: f"{x:,}")
-
-                tabs.append({
-                    "date": date_key.strftime("%Y-%m-%d"),
-                    "date_display": date_key.strftime("%b %d, %Y"),
-                    "rows": g.to_dict("records")
-                })
-
-            video_data.append({
-                "video_id": v["video_id"],
-                "title": v["title"],
-                "paused": v["paused"],
-                "daily_tabs": tabs
-            })
-
-        return render_template("index.html", videos=video_data, last_tick=last_tick)
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO video_list (video_id, title, active) VALUES (%s, %s, TRUE) "
+                "ON CONFLICT (video_id) DO UPDATE SET title=EXCLUDED.title",
+                (vid, title),
+            )
+            # Also store an immediate snapshot right now
+            ts_utc = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+            insert_snapshot(conn, vid, ts_utc, views_val, likes_val)
+        flash(f"Added: {title}", "success")
     except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-        flash("Error loading data.", "error")
-        return render_template("index.html", videos=[], last_tick=None)
+        app.logger.exception(f"Add video failed: {e}")
+        flash("Database error while adding video.", "error")
 
-@app.route("/pause/<video_id>")
-def pause(video_id):
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE yt_tracker.video_list SET paused = TRUE WHERE video_id = %s", (video_id,))
-            conn.commit()
-        flash("Paused.", "info")
-    except Exception as e:
-        logger.error(f"Pause error: {e}")
-        flash("Failed to pause.", "error")
     return redirect(url_for("index"))
 
-@app.route("/resume/<video_id>")
-def resume(video_id):
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE yt_tracker.video_list SET paused = FALSE WHERE video_id = %s", (video_id,))
-            conn.commit()
-        flash("Resumed.", "success")
-    except Exception as e:
-        logger.error(f"Resume error: {e}")
-        flash("Failed to resume.", "error")
+@app.route("/pause/<video_id>", methods=["POST"])
+def pause_video(video_id):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE video_list SET active=FALSE WHERE video_id=%s", (video_id,))
+    flash("Tracking paused.", "info")
     return redirect(url_for("index"))
 
-@app.route("/remove/<video_id>")
-def remove(video_id):
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM yt_tracker.video_list WHERE video_id = %s", (video_id,))
-            conn.commit()
-        flash("Removed.", "info")
-    except Exception as e:
-        logger.error(f"Remove error: {e}")
-        flash("Failed to remove.", "error")
+@app.route("/resume/<video_id>", methods=["POST"])
+def resume_video(video_id):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE video_list SET active=TRUE WHERE video_id=%s", (video_id,))
+    flash("Tracking resumed.", "success")
     return redirect(url_for("index"))
 
-@app.route("/export/<video_id>")
-def export(video_id):
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT title FROM yt_tracker.video_list WHERE video_id = %s", (video_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise ValueError("Video not found")
-                title = row["title"]
+@app.route("/remove/<video_id>", methods=["POST"])
+def remove_video(video_id):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM video_list WHERE video_id=%s", (video_id,))
+    flash("Video and all historical data removed.", "warning")
+    return redirect(url_for("index"))
 
-                cur.execute("""
-                    SELECT timestamp AS "Time (IST)", views AS "Views"
-                    FROM yt_tracker.views
-                    WHERE video_id = %s
-                    ORDER BY timestamp
-                """, (video_id,))
-                rows = cur.fetchall()
+@app.route("/export/<video_id>.xlsx", methods=["GET"])
+def export_excel(video_id):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT ts AT TIME ZONE 'Asia/Kolkata' AS ts_ist, views
+            FROM views
+            WHERE video_id=%s
+            ORDER BY ts ASC
+        """, (video_id,))
+        rows = cur.fetchall()
 
-        df = pd.DataFrame(rows)
-        safe_title = re.sub(r"[^A-Za-z0-9_-]+", "_", title)[:30]
-        filename = f"{safe_title}_views.xlsx"
-        df.to_excel(filename, index=False, engine="openpyxl")
-        return send_file(filename, as_attachment=True, download_name=filename)
-    except Exception as e:
-        logger.error(f"Export error: {e}")
-        flash("Export failed.", "error")
+        cur.execute("SELECT title FROM video_list WHERE video_id=%s", (video_id,))
+        r = cur.fetchone()
+        title = r[0] if r else video_id
+
+    if not rows:
+        flash("No data to export for this video.", "error")
         return redirect(url_for("index"))
 
-@app.route("/health")
-def health():
-    return {"ok": True}, 200
+    df = pd.DataFrame(rows, columns=["Time (IST)", "Views"])
+    # Clean filename from title
+    safe_title = re.sub(r"[^A-Za-z0-9 _-]+", "", title).strip().replace(" ", "_")
+    fname = f"{safe_title}_views.xlsx"
+    path = os.path.join("/tmp", fname)
+    df.to_excel(path, index=False)
 
-# === LOCAL DEV ENTRYPOINT ===
+    return send_file(path, as_attachment=True, download_name=fname, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# Graceful shutdown in local runs (gunicorn handles SIGTERM)
+@app.route("/healthz")
+def healthz():
+    return {"ok": True, "time": datetime.now(IST).isoformat()}
+
+def _shutdown():
+    stop_event.set()
+    if tracker_thread and tracker_thread.is_alive():
+        tracker_thread.join(timeout=3)
+
+import atexit
+atexit.register(_shutdown)
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    init_db()
+    start_tracker_thread()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
