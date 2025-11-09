@@ -26,12 +26,13 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")  # replace in prod
 
 # ---------------------- DB Pool (with fallback) ----------------------
+# Use psycopg_pool if available; otherwise, a tiny fallback with the same .connection() API.
 try:
     from psycopg_pool import ConnectionPool
     pool = ConnectionPool(
         conninfo=DATABASE_URL,
-        min_size=1,
-        max_size=5,
+        min_size=0,   # don't pin connections open on free tiers
+        max_size=3,   # small footprint
         kwargs={
             "autocommit": True,
             "keepalives": 1,
@@ -45,7 +46,9 @@ try:
 except ModuleNotFoundError:
     class _MiniPool:
         def __init__(self, conninfo): self.conninfo = conninfo
-        def connection(self):
+        # accept optional timeout kwarg for compatibility
+        def connection(self, timeout=None):
+            # psycopg connects quickly; ignore pool-level timeout here
             return psycopg.connect(
                 self.conninfo,
                 autocommit=True,
@@ -94,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_views_vid_ts ON views(video_id, ts);
 """
 
 def init_db():
-    with pool.connection() as conn:
+    with pool.connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
 
@@ -198,27 +201,32 @@ def poll_once(conn):
             app.logger.exception(f"DB write failed for {vid}: {e}")
 
 def tracker_loop():
-    app.logger.info("Tracker thread starting...")
-    with pool.connection() as conn:
-        if not try_advisory_lock(conn):
-            app.logger.info("Another instance holds the tracker lock; this thread will idle.")
-            while not stop_event.is_set():
-                time.sleep(5)
-            return
+    app.logger.info("Tracker thread starting (per-iteration connection).")
+    while not stop_event.is_set():
+        try:
+            # Align to the next 5-minute boundary in IST
+            wait_sec = seconds_to_next_5min_boundary_IST()
+            if wait_sec > 0:
+                stop_event.wait(wait_sec)
+                if stop_event.is_set():
+                    break
 
-        app.logger.info("Advisory lock acquired. Background tracking is active.")
-        while not stop_event.is_set():
-            try:
-                wait_sec = seconds_to_next_5min_boundary_IST()
-                if wait_sec > 0:
-                    stop_event.wait(wait_sec)
-                    if stop_event.is_set():
-                        break
-                poll_once(conn)
-                stop_event.wait(2)
-            except Exception as e:
-                app.logger.exception(f"Tracker loop error: {e}")
-                stop_event.wait(10)
+            # Open a connection just for this poll (don’t hold it forever)
+            with pool.connection(timeout=10) as conn:
+                # Advisory lock per iteration; auto-released when conn closes
+                if not try_advisory_lock(conn):
+                    app.logger.debug("Tracker: lock not acquired this round (another instance is polling).")
+                else:
+                    poll_once(conn)
+
+            # Small buffer to avoid duplicate work on the same minute
+            stop_event.wait(2)
+
+        except Exception as e:
+            app.logger.exception(f"Tracker loop error: {e}")
+            # Backoff before retrying to avoid tight loops
+            stop_event.wait(10)
+
     app.logger.info("Tracker thread stopped.")
 
 def start_tracker_thread():
@@ -232,7 +240,7 @@ def start_tracker_thread():
 # ---------------------- Flask Views ----------------------
 @app.route("/", methods=["GET"])
 def index():
-    with pool.connection() as conn, conn.cursor() as cur:
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT
                 video_id,
@@ -307,7 +315,7 @@ def add_video():
     title, views_val, likes_val = stats
 
     try:
-        with pool.connection() as conn, conn.cursor() as cur:
+        with pool.connection(timeout=10) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO video_list (video_id, title, active) VALUES (%s, %s, TRUE) "
                 "ON CONFLICT (video_id) DO UPDATE SET title=EXCLUDED.title",
@@ -324,28 +332,28 @@ def add_video():
 
 @app.route("/pause/<video_id>", methods=["POST"])
 def pause_video(video_id):
-    with pool.connection() as conn, conn.cursor() as cur:
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
         cur.execute("UPDATE video_list SET active=FALSE WHERE video_id=%s", (video_id,))
     flash("Tracking paused.", "info")
     return redirect(url_for("index"))
 
 @app.route("/resume/<video_id>", methods=["POST"])
 def resume_video(video_id):
-    with pool.connection() as conn, conn.cursor() as cur:
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
         cur.execute("UPDATE video_list SET active=TRUE WHERE video_id=%s", (video_id,))
     flash("Tracking resumed.", "success")
     return redirect(url_for("index"))
 
 @app.route("/remove/<video_id>", methods=["POST"])
 def remove_video(video_id):
-    with pool.connection() as conn, conn.cursor() as cur:
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM video_list WHERE video_id=%s", (video_id,))
     flash("Video and all historical data removed.", "warning")
     return redirect(url_for("index"))
 
 @app.route("/export/<video_id>.xlsx", methods=["GET"])
 def export_excel(video_id):
-    with pool.connection() as conn, conn.cursor() as cur:
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT ts AT TIME ZONE 'Asia/Kolkata' AS ts_ist, views
             FROM views
@@ -390,7 +398,7 @@ def bootstrap():
         start_tracker_thread()
     BOOT_DONE = True
 
-# Run bootstrap at import time so gunicorn workers are ready
+# Run bootstrap at import so gunicorn workers are ready
 bootstrap()
 
 # ---------------------- Graceful shutdown ----------------------
