@@ -48,7 +48,6 @@ except ModuleNotFoundError:
         def __init__(self, conninfo): self.conninfo = conninfo
         # accept optional timeout kwarg for compatibility
         def connection(self, timeout=None):
-            # psycopg connects quickly; ignore pool-level timeout here
             return psycopg.connect(
                 self.conninfo,
                 autocommit=True,
@@ -91,6 +90,24 @@ ALTER TABLE views
     ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS views BIGINT,
     ADD COLUMN IF NOT EXISTS likes BIGINT;
+
+-- Drop legacy columns that conflict with inserts (old schemas)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'views' AND column_name = 'date'
+    ) THEN
+        ALTER TABLE public.views DROP COLUMN date;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'views' AND column_name = 'day'
+    ) THEN
+        ALTER TABLE public.views DROP COLUMN day;
+    END IF;
+END $$;
 
 -- Helpful index (safe to re-run)
 CREATE INDEX IF NOT EXISTS idx_views_vid_ts ON views(video_id, ts);
