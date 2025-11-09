@@ -52,8 +52,25 @@ def get_db():
 def init_db():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("CREATE SCHEMA IF NOT EXISTS yt_tracker;")
-    cur.execute("SET search_path TO yt_tracker, public;")
+    
+    # Check if 'name' column exists
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_name = 'video_list' AND column_name = 'name';
+    """)
+    if not cur.fetchone():
+        logger.warning("video_list missing 'name' column. Recreating...")
+        cur.execute("DROP TABLE IF EXISTS yt_tracker.views CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS yt_tracker.video_list CASCADE;")
+
+    # Always ensure correct schema
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS yt_tracker.video_list (
+            video_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            is_tracking INTEGER DEFAULT 1
+        );
+    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS yt_tracker.views (
             video_id TEXT NOT NULL,
@@ -64,14 +81,8 @@ def init_db():
             PRIMARY KEY (video_id, timestamp)
         );
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS yt_tracker.video_list (
-            video_id TEXT PRIMARY KEY,
-            name TEXT,
-            is_tracking INTEGER DEFAULT 1
-        );
-    """)
-    logger.info("Database ready")
+    conn.commit()
+    logger.info("Database schema ready.")
 
 # === YOUTUBE ===
 def extract_video_id(link):
