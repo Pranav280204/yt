@@ -16,13 +16,17 @@
     .tab-content { background: white; border-radius: 8px; padding: 1rem; }
     .table th { background: #f1f3f5; }
     .btn-sm { font-size: 0.8rem; }
+    .meta { font-size: 0.9rem; color: #6c757d; }
   </style>
 </head>
 <body>
 <div class="container py-4">
 
-  <h1 class="text-center mb-4">YouTube Views Tracker</h1>
+  <h1 class="text-center mb-1">YouTube Views Tracker</h1>
   <p class="text-center text-muted mb-4">Track any video every 5 mins • IST Time • Export to Excel</p>
+  {% if last_tick %}
+    <p class="text-center meta">Last update (IST): {{ last_tick }}</p>
+  {% endif %}
 
   <!-- Add Video Form -->
   <div class="card p-4 mb-4">
@@ -40,7 +44,8 @@
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       {% for category, message in messages %}
-        <div class="alert alert-{{ 'danger' if category == 'error' else 'success' }} flash">
+        {% set bs = 'danger' if category == 'error' else ('warning' if category == 'warning' else ('info' if category == 'info' else 'success')) %}
+        <div class="alert alert-{{ bs }} flash mb-3">
           {{ message }}
         </div>
       {% endfor %}
@@ -54,34 +59,34 @@
         <div class="card-header d-flex justify-content-between align-items-center">
           <h5 class="video-title mb-0">
             <a href="https://youtu.be/{{ video.video_id }}" target="_blank" class="text-decoration-none">
-              {{ video.name }}
+              {{ video.title }}
             </a>
           </h5>
-          <div>
+          <div class="d-flex gap-2">
             <a href="{{ url_for('export', video_id=video.video_id) }}" class="btn btn-sm btn-success">Excel</a>
-            {% if video.is_tracking %}
-              <a href="{{ url_for('toggle', video_id=video.video_id) }}" class="btn btn-sm btn-secondary">Pause</a>
+            {% if video.paused %}
+              <a href="{{ url_for('resume', video_id=video.video_id) }}" class="btn btn-sm btn-warning">Resume</a>
             {% else %}
-              <a href="{{ url_for('toggle', video_id=video.video_id) }}" class="btn btn-sm btn-warning">Resume</a>
+              <a href="{{ url_for('pause', video_id=video.video_id) }}" class="btn btn-sm btn-secondary">Pause</a>
             {% endif %}
             <a href="{{ url_for('remove', video_id=video.video_id) }}" class="btn btn-sm btn-danger" onclick="return confirm('Delete all data?')">Remove</a>
           </div>
         </div>
 
-        {% if video.daily_data %}
+        {% if video.daily_tabs %}
           <div class="card-body p-0">
             <ul class="nav nav-tabs nav-fill">
-              {% for date in video.daily_data.keys() %}
+              {% for tab in video.daily_tabs %}
                 <li class="nav-item">
                   <a class="nav-link {% if loop.first %}active{% endif %}" data-bs-toggle="tab" href="#tab-{{ video.video_id }}-{{ loop.index }}">
-                    {{ date }}
+                    {{ tab.date_display }}
                   </a>
                 </li>
               {% endfor %}
             </ul>
 
             <div class="tab-content">
-              {% for date, rows in video.daily_data.items() %}
+              {% for tab in video.daily_tabs %}
                 <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="tab-{{ video.video_id }}-{{ loop.index }}">
                   <div class="table-responsive">
                     <table class="table table-sm table-hover mb-0">
@@ -94,14 +99,14 @@
                         </tr>
                       </thead>
                       <tbody>
-                        {% for row in rows %}
+                        {% for row in tab.rows %}
                           <tr>
-                            <td>{{ row[0] }}</td>
-                            <td>{{ row[1] }}</td>
-                            <td class="{% if '+' in row[2] %}gain-positive{% else %}gain-zero{% endif %}">
-                              {{ row[2] }}
+                            <td>{{ row.time_str }}</td>
+                            <td>{{ row.views_str }}</td>
+                            <td class="{{ 'gain-positive' if row.gain_5min > 0 else 'gain-zero' }}">
+                              {{ '+' ~ row.gain_5min if row.gain_5min > 0 else row.gain_5min }}
                             </td>
-                            <td class="hourly-rate">{{ row[3] }}</td>
+                            <td class="hourly-rate">{{ row.hourly_rate }}</td>
                           </tr>
                         {% endfor %}
                       </tbody>
