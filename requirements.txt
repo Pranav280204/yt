@@ -1,8 +1,16 @@
+# Core
 Flask==2.3.3
+gunicorn==23.0.0
+
+# YouTube API
 google-api-python-client==2.149.0
+
+# Data
 pandas==2.2.3
 openpyxl==3.1.5
-pytz==2024.2
-psutil==6.0.0
-gunicorn==23.0.0
+
+# DB
 psycopg[binary]==3.2.3
+
+# REMOVE pytz – we use built-in zoneinfo (thread-safe)
+# REMOVE psutil – not needed
