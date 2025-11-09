@@ -1,0 +1,4 @@
+views.db
+__pycache__
+*.pyc
+views.db *.xlsx pycache/
