@@ -57,6 +57,7 @@ except ModuleNotFoundError:
 
 # ---------------------- DB Bootstrap ----------------------
 SCHEMA_SQL = """
+-- videos being tracked
 CREATE TABLE IF NOT EXISTS video_list (
     id SERIAL PRIMARY KEY,
     video_id TEXT UNIQUE NOT NULL,
@@ -65,15 +66,22 @@ CREATE TABLE IF NOT EXISTS video_list (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 5-minute snapshots
 CREATE TABLE IF NOT EXISTS views (
     id BIGSERIAL PRIMARY KEY,
     video_id TEXT NOT NULL REFERENCES video_list(video_id) ON DELETE CASCADE,
     ts TIMESTAMPTZ NOT NULL,
-    day DATE GENERATED ALWAYS AS (DATE(ts AT TIME ZONE 'Asia/Kolkata')) STORED,
     views BIGINT,
     likes BIGINT
 );
 
+-- In case an older/broken table exists, add missing columns safely
+ALTER TABLE views
+    ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL,
+    ADD COLUMN IF NOT EXISTS views BIGINT,
+    ADD COLUMN IF NOT EXISTS likes BIGINT;
+
+-- Helpful indexes
 CREATE INDEX IF NOT EXISTS idx_views_vid_ts ON views(video_id, ts);
 CREATE INDEX IF NOT EXISTS idx_views_day ON views(day);
 """
