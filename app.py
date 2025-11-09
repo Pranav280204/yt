@@ -52,8 +52,27 @@ def get_db():
 def init_db():
     conn = get_db()
     cur = conn.cursor()
+    
+    # Auto-heal: Recreate if 'name' column missing
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_name = 'video_list' AND table_schema = 'yt_tracker' AND column_name = 'name';
+    """)
+    if not cur.fetchone():
+        logger.warning("video_list missing 'name' column. Recreating...")
+        cur.execute("DROP TABLE IF EXISTS yt_tracker.views CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS yt_tracker.video_list CASCADE;")
+
     cur.execute("CREATE SCHEMA IF NOT EXISTS yt_tracker;")
     cur.execute("SET search_path TO yt_tracker, public;")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS yt_tracker.video_list (
+            video_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            is_tracking INTEGER DEFAULT 1
+        );
+    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS yt_tracker.views (
             video_id TEXT NOT NULL,
@@ -64,14 +83,8 @@ def init_db():
             PRIMARY KEY (video_id, timestamp)
         );
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS yt_tracker.video_list (
-            video_id TEXT PRIMARY KEY,
-            name TEXT,
-            is_tracking INTEGER DEFAULT 1
-        );
-    """)
-    logger.info("Database ready")
+    conn.commit()
+    logger.info("Database schema ready")
 
 # === YOUTUBE ===
 def extract_video_id(link):
@@ -135,7 +148,7 @@ def background_task():
         seconds_into_5min = (now.minute % 5) * 60 + now.second
         wait = max(1, 300 - seconds_into_5min)
         next_time = (now + timedelta(seconds=wait)).strftime("%H:%M:%S")
-        logger.info(f"Next poll in {wait}s → {next_time}")
+        logger.info(f"Next poll in {wait}s to {next_time}")
         time.sleep(wait)
         try:
             run_poll()
@@ -198,7 +211,7 @@ def index():
             cur.execute("""
                 SELECT timestamp, views FROM yt_tracker.views
                 WHERE video_id=%s AND date=%s
-                ORDER BY timestamp
+                ORDER BY timestamp DESC  -- NEWEST FIRST
             """, (vid, d))
             rows = cur.fetchall()
             processed = []
@@ -222,6 +235,7 @@ def index():
                     f"+{gain:,}" if gain > 0 else "0",
                     f"+{hourly:,}/hr"
                 ))
+            processed.reverse()  # NEWEST ON TOP
             daily[d] = processed
         videos.append({
             "video_id": vid,
@@ -253,7 +267,7 @@ def export(video_id):
     cur = get_db().cursor()
     cur.execute("SELECT name FROM yt_tracker.video_list WHERE video_id=%s", (video_id,))
     name = cur.fetchone()["name"]
-    cur.execute("SELECT timestamp, views FROM yt_tracker.views WHERE video_id=%s ORDER BY timestamp", (video_id,))
+    cur.execute("SELECT timestamp, views FROM yt_tracker.views WHERE video_id=%s ORDER BY timestamp DESC", (video_id,))
     df = pd.DataFrame([{"Time (IST)": r["timestamp"], "Views": r["views"]} for r in cur.fetchall()])
     fname = "export.xlsx"
     df.to_excel(fname, index=False, engine="openpyxl")
