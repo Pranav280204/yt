@@ -10,7 +10,7 @@ from urllib.parse import urlparse, parse_qs
 from flask import Flask, render_template, request, redirect, url_for, flash, send_file
 from googleapiclient.discovery import build
 import pandas as pd
-import psycopg  # core driver for psycopg3
+import psycopg  # psycopg3 core driver
 
 # ---------------------- Config ----------------------
 IST = ZoneInfo("Asia/Kolkata")
@@ -26,7 +26,6 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")  # replace in prod
 
 # ---------------------- DB Pool (with fallback) ----------------------
-# Prefer psycopg_pool if installed; else use a tiny fallback with the same .connection() API.
 try:
     from psycopg_pool import ConnectionPool
     pool = ConnectionPool(
@@ -55,7 +54,7 @@ except ModuleNotFoundError:
     pool = _MiniPool(DATABASE_URL)
     app.logger.warning("psycopg_pool not found; using fallback mini-pool")
 
-# ---------------------- DB Bootstrap ----------------------
+# ---------------------- DB Bootstrap (migration-safe) ----------------------
 SCHEMA_SQL = """
 -- Ensure table exists with the minimum key so we can ALTER safely
 CREATE TABLE IF NOT EXISTS video_list (
@@ -68,16 +67,12 @@ ALTER TABLE video_list
     ADD COLUMN IF NOT EXISTS active BOOLEAN,
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
 
--- Set sane defaults + backfill NULLs, then enforce NOT NULL
+-- Defaults + backfill for legacy rows
 ALTER TABLE video_list ALTER COLUMN active SET DEFAULT TRUE;
 UPDATE video_list SET active = TRUE WHERE active IS NULL;
 
 ALTER TABLE video_list ALTER COLUMN created_at SET DEFAULT NOW();
 UPDATE video_list SET created_at = NOW() WHERE created_at IS NULL;
-
--- Keep title nullable (we’ll fill it on add/refresh), or enforce if you prefer:
--- UPDATE video_list SET title = COALESCE(title, 'Unknown Title');
--- ALTER TABLE video_list ALTER COLUMN title SET NOT NULL;
 
 -- Snapshots table (create if missing)
 CREATE TABLE IF NOT EXISTS views (
@@ -149,7 +144,6 @@ def fetch_video_stats(video_id: str):
         return None
 
 # ---------------------- Advisory Lock ----------------------
-# Prevent multiple trackers across dynos/processes.
 ADVISORY_LOCK_KEY = 814_220_415_337_129_001  # arbitrary 64-bit number
 
 def try_advisory_lock(conn) -> bool:
@@ -196,7 +190,7 @@ def poll_once(conn):
         if not stats:
             app.logger.warning(f"Stats unavailable for {vid}; skipping this round.")
             continue
-        title, views_val, likes_val = stats
+        _, views_val, likes_val = stats
         try:
             insert_snapshot(conn, vid, ts_utc, views_val, likes_val)
             app.logger.info(f"Saved snapshot {vid} @ {ts_utc.isoformat()} views={views_val} likes={likes_val}")
@@ -239,7 +233,15 @@ def start_tracker_thread():
 @app.route("/", methods=["GET"])
 def index():
     with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT video_id, title, active, created_at FROM video_list ORDER BY created_at DESC")
+        cur.execute("""
+            SELECT
+                video_id,
+                COALESCE(title, '(unknown)') AS title,
+                COALESCE(active, TRUE)       AS active,
+                COALESCE(created_at, NOW())  AS created_at
+            FROM video_list
+            ORDER BY created_at DESC
+        """)
         videos = cur.fetchall()
 
         data_per_video = {}
@@ -352,7 +354,7 @@ def export_excel(video_id):
         """, (video_id,))
         rows = cur.fetchall()
 
-        cur.execute("SELECT title FROM video_list WHERE video_id=%s", (video_id,))
+        cur.execute("SELECT COALESCE(title, %s) FROM video_list WHERE video_id=%s", (video_id, video_id))
         r = cur.fetchone()
         title = r[0] if r else video_id
 
@@ -401,6 +403,5 @@ import atexit
 atexit.register(_shutdown)
 
 if __name__ == "__main__":
-    # Safe to call again; guarded by BOOT_DONE
     bootstrap()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
