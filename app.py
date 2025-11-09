@@ -57,16 +57,29 @@ except ModuleNotFoundError:
 
 # ---------------------- DB Bootstrap ----------------------
 SCHEMA_SQL = """
--- videos being tracked
+-- Ensure table exists with the minimum key so we can ALTER safely
 CREATE TABLE IF NOT EXISTS video_list (
-    id SERIAL PRIMARY KEY,
-    video_id TEXT UNIQUE NOT NULL,
-    title TEXT NOT NULL,
-    active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    video_id TEXT PRIMARY KEY
 );
 
--- 5-minute snapshots
+-- Add columns if they’re missing (idempotent)
+ALTER TABLE video_list
+    ADD COLUMN IF NOT EXISTS title TEXT,
+    ADD COLUMN IF NOT EXISTS active BOOLEAN,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+
+-- Set sane defaults + backfill NULLs, then enforce NOT NULL
+ALTER TABLE video_list ALTER COLUMN active SET DEFAULT TRUE;
+UPDATE video_list SET active = TRUE WHERE active IS NULL;
+
+ALTER TABLE video_list ALTER COLUMN created_at SET DEFAULT NOW();
+UPDATE video_list SET created_at = NOW() WHERE created_at IS NULL;
+
+-- Keep title nullable (we’ll fill it on add/refresh), or enforce if you prefer:
+-- UPDATE video_list SET title = COALESCE(title, 'Unknown Title');
+-- ALTER TABLE video_list ALTER COLUMN title SET NOT NULL;
+
+-- Snapshots table (create if missing)
 CREATE TABLE IF NOT EXISTS views (
     id BIGSERIAL PRIMARY KEY,
     video_id TEXT NOT NULL REFERENCES video_list(video_id) ON DELETE CASCADE,
@@ -75,13 +88,13 @@ CREATE TABLE IF NOT EXISTS views (
     likes BIGINT
 );
 
--- In case an older/broken table exists, add missing columns safely
+-- Add missing columns if an older broken table exists
 ALTER TABLE views
-    ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL,
+    ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS views BIGINT,
     ADD COLUMN IF NOT EXISTS likes BIGINT;
 
--- Helpful indexes
+-- Helpful index (safe to re-run)
 CREATE INDEX IF NOT EXISTS idx_views_vid_ts ON views(video_id, ts);
 """
 
