@@ -4,59 +4,34 @@
   <meta charset="utf-8">
   <title>YouTube Views Tracker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Bootstrap (CDN) -->
+  <!-- Bootstrap -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-
   <style>
     :root{
-      --bg: #ffffff;
-      --text: #0b0b0b;          /* dark black for text */
-      --muted: #5a6570;         /* subtle gray */
-      --border: #e9edf3;        /* faint blue-ish border */
-      --primary: #2a66ff;       /* faint blue accent for primary */
-      --green: #18a957;         /* green for positive gains */
-      --red: #d23b3b;           /* red for negative */
-      --pill: #eef4ff;          /* light blue pill bg */
-      --pill-active: #dfe9ff;   /* slightly darker when active */
-      --card: #ffffff;          /* white cards */
-      --hover: #f7f9fc;         /* light hover */
+      --accent-blue:#e9f3ff;   /* faint blue bg */
+      --accent-green:#e9f9f0;  /* faint green bg */
+      --accent-red:#ffecec;    /* faint red bg */
+      --text-dark:#0a0a0a;     /* near-black text */
+      --muted:#5b5b5b;
+      --border:#e6e6e6;
     }
-    body { background: var(--bg); color: var(--text); }
-    .container { max-width: 1100px; }
-    .muted { color: var(--muted); }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
-    .card .card-body { padding: 1.1rem 1.2rem; }
-    .btn-primary { background: var(--primary); border-color: var(--primary); }
-    .btn-outline-warning { color: #bf7b00; border-color: #ffd8a8; }
-    .btn-outline-warning:hover { background:#fff3e0; }
-    .btn-outline-danger { color:#b61e1e; border-color:#ffd6d6; }
-    .btn-outline-danger:hover { background:#fff0f0; }
-    .btn-outline-light { color:#1f3e7a; border-color: var(--border); }
-    .btn-outline-light:hover { background: var(--hover); }
-
-    .badge.paused { background: #adb5bd; }
-    .nav-pills .nav-link { background: var(--pill); color: #173b7a; border: 1px solid var(--border); margin-right: .5rem; }
-    .nav-pills .nav-link.active { background: var(--pill-active); color: #0f2c64; }
-
-    .table thead th { color: var(--muted); border-bottom-color: var(--border); }
-    .table tbody tr:hover { background: var(--hover); }
-    .table { color: var(--text); }
-    .gain-pos { color: var(--green); font-weight: 600; }
-    .gain-neg { color: var(--red); font-weight: 600; }
-    .gain-null { color: var(--muted); }
-    a, .btn-link { color: #1f4fd6; }
-
-    /* small niceties */
-    .pillwrap { overflow-x:auto; white-space:nowrap; }
-    .tools .btn { height: 36px; }
-    .title-row h4 { font-size: 1.05rem; }
+    body{ background:#ffffff; color:var(--text-dark);}
+    .card{ background:#fff; border:1px solid var(--border); }
+    .badge.paused{ background:#adb5bd; }
+    .gain-pos{ background:var(--accent-green); padding:.1rem .4rem; border-radius:.25rem;}
+    .gain-neg{ background:var(--accent-red); padding:.1rem .4rem; border-radius:.25rem;}
+    .gain-null{ color:var(--muted); }
+    .muted{ color:var(--muted);}
+    .tab-btn{ border:1px solid var(--border); background:#fff; }
+    .tab-btn.active{ background:var(--accent-blue); }
+    .table thead th{ color:#222; }
+    .btn-outline-light{ border-color:var(--border); }
   </style>
 </head>
 <body>
 <div class="container py-4">
-
-  <h1 class="mb-1">📈 YouTube Views Tracker</h1>
-  <p class="muted mb-4">All times in IST (Asia/Kolkata). Sampled every 5 minutes (00, 05, 10, ...).</p>
+  <h1 class="mb-2">📈 YouTube Views Tracker</h1>
+  <p class="muted">All timestamps shown in IST (Asia/Kolkata). Samples every 5 minutes (00, 05, 10, …).</p>
 
   <!-- Alerts -->
   {% with messages = get_flashed_messages(with_categories=true) %}
@@ -91,51 +66,44 @@
   {% endif %}
 
   <div class="row g-3">
-  {% for v in videos %}
-    <div class="col-12">
-      <div class="card">
-        <div class="card-body">
-          <div class="title-row d-flex align-items-center justify-content-between flex-wrap">
-            <h4 class="mb-2">
-              {{ v.name }}
-              {% if not v.is_tracking %}
-                <span class="badge paused ms-2">Paused</span>
-              {% endif %}
-            </h4>
-            <div class="tools mb-2 d-flex gap-2">
-              <a class="btn btn-sm btn-outline-light" href="{{ url_for('export_video', video_id=v.video_id) }}">Export to Excel</a>
-              <a class="btn btn-sm btn-outline-warning" href="{{ url_for('stop_tracking', video_id=v.video_id) }}">
-                {% if v.is_tracking %}Pause{% else %}Resume{% endif %}
-              </a>
-              <a class="btn btn-sm btn-outline-danger" href="{{ url_for('remove_video', video_id=v.video_id) }}" onclick="return confirm('Delete this video and ALL its data?')">Remove</a>
+    {% for v in videos %}
+      <div class="col-12">
+        <div class="card">
+          <div class="card-body">
+            <div class="d-flex align-items-center justify-content-between flex-wrap">
+              <h4 class="mb-2">
+                {{ v.name }}
+                {% if not v.is_tracking %}
+                  <span class="badge paused ms-2">Paused</span>
+                {% endif %}
+              </h4>
+              <div class="mb-2 d-flex gap-2">
+                <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('export_video', video_id=v.video_id) }}">Export to Excel</a>
+                <a class="btn btn-sm btn-outline-warning" href="{{ url_for('stop_tracking', video_id=v.video_id) }}">
+                  {% if v.is_tracking %}Pause{% else %}Resume{% endif %}
+                </a>
+                <a class="btn btn-sm btn-outline-danger" href="{{ url_for('remove_video', video_id=v.video_id) }}" onclick="return confirm('Delete this video and ALL its data?')">Remove</a>
+              </div>
             </div>
-          </div>
 
-          {% if v.daily_data|length == 0 %}
-            <p class="muted mb-0">No samples yet. First snapshot will appear after the next 5-minute tick.</p>
-          {% else %}
-            <!-- Day Tabs -->
-            <div class="pillwrap">
-              <ul class="nav nav-pills mb-3" id="pills-{{ v.video_id }}" role="tablist" style="display:inline-flex;">
+            {% if v.daily_data|length == 0 %}
+              <p class="muted mb-0">No samples yet. First snapshot will appear after the next tick.</p>
+            {% else %}
+              <!-- Day Pills (newest first already) -->
+              <div class="mb-3 d-flex flex-wrap gap-2">
                 {% set first = True %}
                 {% for d, rows in v.daily_data.items() %}
-                  <li class="nav-item" role="presentation">
-                    <button class="nav-link {% if first %}active{% endif %}" id="tab-{{ v.video_id }}-{{ loop.index }}"
-                            data-bs-toggle="pill" data-bs-target="#pane-{{ v.video_id }}-{{ loop.index }}"
-                            type="button" role="tab" aria-controls="pane-{{ v.video_id }}-{{ loop.index }}"
-                            aria-selected="{{ 'true' if first else 'false' }}">
-                      {{ d }}
-                    </button>
-                  </li>
+                  <button class="btn btn-sm tab-btn {% if first %}active{% endif %}" data-bs-toggle="collapse"
+                          data-bs-target="#pane-{{ v.video_id }}-{{ loop.index }}" aria-expanded="{{ 'true' if first else 'false' }}">
+                    {{ d }}
+                  </button>
                   {% set first = False %}
                 {% endfor %}
-              </ul>
-            </div>
+              </div>
 
-            <div class="tab-content" id="pills-content-{{ v.video_id }}">
               {% set first = True %}
               {% for d, rows in v.daily_data.items() %}
-                <div class="tab-pane fade {% if first %}show active{% endif %}" id="pane-{{ v.video_id }}-{{ loop.index }}" role="tabpanel">
+                <div id="pane-{{ v.video_id }}-{{ loop.index }}" class="collapse {% if first %}show{% endif %}">
                   <div class="table-responsive">
                     <table class="table table-sm align-middle">
                       <thead>
@@ -147,43 +115,50 @@
                         </tr>
                       </thead>
                       <tbody>
-                        {# Newest first: reverse the processed list #}
-                        {% for ts, views, gain, hourly in rows|reverse %}
-                          <tr>
-                            <td class="muted">{{ ts }}</td>
-                            <td>{{ "{:,}".format(views) }}</td>
-                            <td>
-                              {% if gain is none %}
-                                <span class="gain-null">—</span>
+                      {# rows are newest-first already #}
+                      {% for ts, views, gain, hourly in rows %}
+                        <tr>
+                          <td>{{ ts }}</td>
+                          <td>{{ "{:,}".format(views) }}</td>
+                          <td>
+                            {% if gain is none %}
+                              <span class="gain-null">—</span>
+                            {% else %}
+                              {% if gain >= 0 %}
+                                <span class="gain-pos">+{{ "{:,}".format(gain) }}</span>
                               {% else %}
-                                <span class="{{ 'gain-pos' if gain>=0 else 'gain-neg' }}">{{ '+' if gain>=0 else '' }}{{ "{:,}".format(gain) }}</span>
+                                <span class="gain-neg">{{ "{:,}".format(gain) }}</span>
                               {% endif %}
-                            </td>
-                            <td>
-                              {% if hourly is none %}
-                                <span class="gain-null">—</span>
+                            {% endif %}
+                          </td>
+                          <td>
+                            {% if hourly is none %}
+                              <span class="gain-null">—</span>
+                            {% else %}
+                              {% if hourly >= 0 %}
+                                <span class="gain-pos">+{{ "{:,}".format(hourly) }}</span>
                               {% else %}
-                                <span class="{{ 'gain-pos' if hourly>=0 else 'gain-neg' }}">{{ '+' if hourly>=0 else '' }}{{ "{:,}".format(hourly) }}</span>
+                                <span class="gain-neg">{{ "{:,}".format(hourly) }}</span>
                               {% endif %}
-                            </td>
-                          </tr>
-                        {% endfor %}
+                            {% endif %}
+                          </td>
+                        </tr>
+                      {% endfor %}
                       </tbody>
                     </table>
                   </div>
                 </div>
                 {% set first = False %}
               {% endfor %}
-            </div>
-          {% endif %}
+            {% endif %}
+          </div>
         </div>
       </div>
-    </div>
-  {% endfor %}
+    {% endfor %}
   </div>
 
   <footer class="mt-4 mb-3 text-center muted">
-    Runs every 5 minutes • Stored in PostgreSQL • Export as .xlsx
+    Stored in PostgreSQL • UTC in DB, shown in IST • No graphs
   </footer>
 </div>
 
