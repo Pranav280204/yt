@@ -1,445 +1,485 @@
 import os
+import re
 import threading
-import logging
 import time
-from datetime import datetime, timedelta
-from io import BytesIO
-from urllib.parse import urlparse, parse_qs
+import math
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, parse_qs
 
-import pandas as pd
-from flask import (
-    Flask, render_template, request, redirect, url_for,
-    flash, send_file
-)
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-import psycopg
-from psycopg.rows import dict_row
+import pandas as pd
+import psycopg  # psycopg3 core driver
 
-# -----------------------------
-# Flask & Logging Setup
-# -----------------------------
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", os.urandom(24))
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
+# ---------------------- Config ----------------------
 IST = ZoneInfo("Asia/Kolkata")
+DATABASE_URL = os.getenv("DATABASE_URL")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY") or os.getenv("YOUTUBE_APIKEY") or os.getenv("YOUTUBE_API_KEY_V3")
 
-# -----------------------------
-# Env & External Services
-# -----------------------------
-API_KEY = os.getenv("YOUTUBE_API_KEY", "")
-YOUTUBE = None
-if API_KEY:
-    try:
-        YOUTUBE = build("youtube", "v3", developerKey=API_KEY, cache_discovery=False)
-        logger.info("YouTube client initialized.")
-    except Exception as e:
-        logger.exception("Failed to initialize YouTube client: %s", e)
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is required")
+if not YOUTUBE_API_KEY:
+    raise RuntimeError("YOUTUBE_API_KEY env var is required")
 
-POSTGRES_URL = os.getenv("DATABASE_URL")
-if not POSTGRES_URL:
-    logger.warning("DATABASE_URL not set. Please configure your Postgres connection string.")
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")  # replace in prod
 
-# -----------------------------
-# Database Connection (global)
-# -----------------------------
-_db_conn = None
-_db_lock = threading.Lock()
+# ---------------------- DB Pool (with fallback) ----------------------
+try:
+    from psycopg_pool import ConnectionPool
+    pool = ConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=0,   # free-tier friendly
+        max_size=3,
+        kwargs={
+            "autocommit": True,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 3,
+            "options": "-c timezone=UTC",
+        },
+    )
+    app.logger.info("Using psycopg ConnectionPool")
+except ModuleNotFoundError:
+    class _MiniPool:
+        def __init__(self, conninfo): self.conninfo = conninfo
+        def connection(self, timeout=None):
+            return psycopg.connect(self.conninfo, autocommit=True, options="-c timezone=UTC")
+    pool = _MiniPool(DATABASE_URL)
+    app.logger.warning("psycopg_pool not found; using fallback mini-pool")
 
-def get_db():
+# ---------------------- Time helpers ----------------------
+def seconds_to_next_5min_boundary_IST(now_utc: datetime | None = None) -> float:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(IST)
+    minute = now_ist.minute
+    if minute % 5 == 0 and now_ist.second < 3:
+        return 0.0
+    next_block_min = (minute // 5 + 1) * 5
+    if next_block_min >= 60:
+        target = now_ist.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        target = now_ist.replace(minute=next_block_min, second=0, microsecond=0)
+    return max((target - now_ist).total_seconds(), 0.0)
+
+def ist_slot_to_utc(now_utc: datetime | None = None) -> datetime:
     """
-    Returns a live psycopg3 connection with autocommit and TCP keepalives.
-    Reconnects if the existing connection is closed.
+    Return the start of the current 5-minute slot in IST as a UTC timestamptz (sec=0).
+    Example: IST 01:02 -> 01:00 IST -> converted to UTC.
     """
-    global _db_conn
-    with _db_lock:
-        if _db_conn is None or _db_conn.closed:
-            logger.info("Opening DB connection...")
-            _db_conn = psycopg.connect(
-                POSTGRES_URL,
-                autocommit=True,
-                row_factory=dict_row,
-                # TCP keepalives (works on most managed Postgres)
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=5,
-            )
-        return _db_conn
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(IST)
+    floored_min = (now_ist.minute // 5) * 5
+    slot_ist = now_ist.replace(minute=floored_min, second=0, microsecond=0)
+    return slot_ist.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
+
+# ---------------------- DB Bootstrap (migration-safe) ----------------------
+SCHEMA_SQL = """
+-- Ensure base table exists so we can ALTER safely
+CREATE TABLE IF NOT EXISTS video_list (
+    video_id TEXT PRIMARY KEY
+);
+
+-- Add columns if missing
+ALTER TABLE video_list
+    ADD COLUMN IF NOT EXISTS title TEXT,
+    ADD COLUMN IF NOT EXISTS active BOOLEAN,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+
+ALTER TABLE video_list ALTER COLUMN active SET DEFAULT TRUE;
+UPDATE video_list SET active = TRUE WHERE active IS NULL;
+
+ALTER TABLE video_list ALTER COLUMN created_at SET DEFAULT NOW();
+UPDATE video_list SET created_at = NOW() WHERE created_at IS NULL;
+
+-- Snapshots table (create if missing)
+CREATE TABLE IF NOT EXISTS views (
+    id BIGSERIAL PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES video_list(video_id) ON DELETE CASCADE,
+    ts TIMESTAMPTZ NOT NULL,
+    views BIGINT,
+    likes BIGINT
+);
+
+-- Add missing columns if an older/broken table exists
+ALTER TABLE views
+    ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS views BIGINT,
+    ADD COLUMN IF NOT EXISTS likes BIGINT;
+
+-- === Legacy column cleanup/migration ===
+DO $$
+BEGIN
+    -- If old 'timestamp' column exists:
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'views' AND column_name = 'timestamp'
+    ) THEN
+        -- If ts doesn't exist, rename legacy column to ts (no casting)
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'views' AND column_name = 'ts'
+        ) THEN
+            EXECUTE 'ALTER TABLE public.views RENAME COLUMN "timestamp" TO ts';
+        ELSE
+            -- ts already exists -> drop legacy column to avoid NOT NULL conflicts
+            EXECUTE 'ALTER TABLE public.views DROP COLUMN "timestamp"';
+        END IF;
+    END IF;
+
+    -- Drop older auxiliary date/day if present
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'views' AND column_name = 'date'
+    ) THEN
+        EXECUTE 'ALTER TABLE public.views DROP COLUMN "date"';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'views' AND column_name = 'day'
+    ) THEN
+        EXECUTE 'ALTER TABLE public.views DROP COLUMN "day"';
+    END IF;
+END $$;
+
+-- Helpful non-unique index (unique added after dedup in app code)
+CREATE INDEX IF NOT EXISTS idx_views_vid_ts ON views(video_id, ts);
+"""
 
 def init_db():
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS video_list (
-            video_id   TEXT PRIMARY KEY,
-            name       TEXT NOT NULL,
-            is_tracking BOOLEAN NOT NULL DEFAULT TRUE
-        );
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS views (
-            video_id TEXT NOT NULL,
-            date     DATE NOT NULL,
-            ts       TIMESTAMP WITHOUT TIME ZONE NOT NULL,
-            views    BIGINT NOT NULL,
-            likes    BIGINT,
-            PRIMARY KEY (video_id, ts),
-            FOREIGN KEY (video_id) REFERENCES video_list(video_id) ON DELETE CASCADE
-        );
-        """)
-    logger.info("Database schema ready.")
+    with pool.connection(timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_SQL)
 
-# -----------------------------
-# YouTube Helpers
-# -----------------------------
-def extract_video_id(link: str) -> str | None:
-    """
-    Supports:
-      - https://www.youtube.com/watch?v=VIDEOID
-      - https://youtu.be/VIDEOID
-      - m.youtube.com, youtube.com/shorts/VIDEOID
-      - With extra params like &t=30s
-    """
+            # ---- Normalize legacy rows to IST 5-min slots (sec=0) ----
+            cur.execute("""
+                UPDATE views
+                SET ts = (
+                    (
+                        date_trunc('minute', (ts AT TIME ZONE 'Asia/Kolkata'))
+                        - make_interval(mins => MOD(EXTRACT(MINUTE FROM (ts AT TIME ZONE 'Asia/Kolkata'))::int, 5))
+                    ) AT TIME ZONE 'Asia/Kolkata'
+                )
+                WHERE EXTRACT(SECOND FROM ts) <> 0
+                   OR MOD(EXTRACT(MINUTE FROM (ts AT TIME ZONE 'Asia/Kolkata'))::int, 5) <> 0
+            """)
+
+            # ---- Deduplicate (keep the most recent id) before unique index ----
+            cur.execute("""
+                DELETE FROM views v
+                USING (
+                    SELECT video_id, ts, MAX(id) AS keep_id, COUNT(*) AS cnt
+                    FROM views
+                    GROUP BY 1,2
+                    HAVING COUNT(*) > 1
+                ) d
+                WHERE v.video_id = d.video_id
+                  AND v.ts = d.ts
+                  AND v.id <> d.keep_id
+            """)
+
+            # ---- Enforce uniqueness per slot ----
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uniq_views_vid_ts ON views(video_id, ts)")
+
+# ---------------------- YouTube API ----------------------
+def yt_client():
+    return build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
+
+YOUTUBE_ID_RX = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+def extract_video_id(url_or_id: str) -> str | None:
+    s = url_or_id.strip()
+    if YOUTUBE_ID_RX.match(s):
+        return s
     try:
-        u = urlparse(link.strip())
-        host = (u.netloc or "").lower()
-
-        if "youtu.be" in host:
-            # Path starts with /VIDEOID
-            vid = u.path.strip("/").split("/")[0]
-            return vid or None
-
-        if "youtube.com" in host:
-            # /watch?v=ID  or /shorts/ID
-            if u.path == "/watch":
-                qs = parse_qs(u.query)
-                return (qs.get("v") or [None])[0]
-            parts = u.path.strip("/").split("/")
-            if len(parts) >= 2 and parts[0] in {"shorts", "live"}:
-                return parts[1]
-        return None
+        u = urlparse(s)
+        if u.netloc.endswith("youtube.com"):
+            qs = parse_qs(u.query)
+            if "v" in qs and qs["v"]:
+                return qs["v"][0][:11]
+            parts = [p for p in u.path.split("/") if p]
+            if parts and YOUTUBE_ID_RX.match(parts[-1]):
+                return parts[-1]
+        if u.netloc.endswith("youtu.be"):
+            path = u.path.strip("/")
+            if YOUTUBE_ID_RX.match(path[:11]):
+                return path[:11]
     except Exception:
+        pass
+    return None
+
+def fetch_video_stats(video_id: str):
+    """Return (title, views, likes) or None on failure."""
+    try:
+        yt = yt_client()
+        resp = yt.videos().list(part="snippet,statistics", id=video_id).execute()
+        items = resp.get("items", [])
+        if not items:
+            return None
+        item = items[0]
+        title = item["snippet"]["title"]
+        stats = item.get("statistics", {})
+        views = int(stats.get("viewCount", 0))
+        likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else None
+        return title, views, likes
+    except Exception as e:
+        app.logger.exception(f"YouTube API error for {video_id}: {e}")
         return None
 
-def fetch_video_title(video_id: str) -> str:
-    if not YOUTUBE:
-        return "Unknown"
-    try:
-        resp = YOUTUBE.videos().list(
-            part="snippet",
-            id=video_id,
-            maxResults=1
-        ).execute()
-        items = resp.get("items", [])
-        title = (items[0]["snippet"]["title"] if items else "Unknown")[:100]
-        return title or "Unknown"
-    except HttpError as e:
-        logger.error("YouTube API error (title) for %s: %s", video_id, e)
-        return "Unknown"
-    except Exception as e:
-        logger.exception("Error fetching title: %s", e)
-        return "Unknown"
+# ---------------------- Advisory Lock ----------------------
+ADVISORY_LOCK_KEY = 814_220_415_337_129_001  # arbitrary 64-bit number
 
-def fetch_views_batch(video_ids: list[str]) -> dict:
-    """
-    Returns: { video_id: { 'views': int, 'likes': int|None } }
-    """
-    if not YOUTUBE or not video_ids:
-        return {}
-    out = {}
-    # YouTube videos.list can take up to 50 IDs per call
-    try:
-        for i in range(0, len(video_ids), 50):
-            chunk = video_ids[i:i+50]
-            resp = YOUTUBE.videos().list(
-                part="statistics",
-                id=",".join(chunk),
-                maxResults=50
-            ).execute()
-            for it in resp.get("items", []):
-                vid = it["id"]
-                stats = it.get("statistics", {})
-                views = int(stats.get("viewCount", "0") or 0)
-                likes = stats.get("likeCount")
-                likes = int(likes) if likes is not None else None
-                out[vid] = {"views": views, "likes": likes}
-    except HttpError as e:
-        logger.error("YouTube API error (stats batch): %s", e)
-    except Exception as e:
-        logger.exception("Error fetching stats: %s", e)
-    return out
-
-# -----------------------------
-# Storage Helpers
-# -----------------------------
-def ist_now():
-    return datetime.now(IST).replace(microsecond=0)
-
-def safe_store(video_id: str, stats: dict):
-    """
-    Defensive 'delete+insert' at (video_id, ts) second precision.
-    """
-    ts = ist_now()
-    date_only = ts.date()
-    views = int(stats.get("views", 0))
-    likes = stats.get("likes")
-
-    conn = get_db()
+def try_advisory_lock(conn) -> bool:
     with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+        return cur.fetchone()[0]
+
+# ---------------------- Background Tracker ----------------------
+stop_event = threading.Event()
+tracker_thread = None
+
+def insert_snapshot(conn, video_id: str, ts_utc: datetime, views_val: int | None, likes_val: int | None):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM views WHERE video_id=%s AND ts=%s", (video_id, ts_utc))
         cur.execute(
-            "DELETE FROM views WHERE video_id=%s AND ts=%s",
-            (video_id, ts)
-        )
-        cur.execute(
-            "INSERT INTO views (video_id, date, ts, views, likes) VALUES (%s, %s, %s, %s, %s)",
-            (video_id, date_only, ts, views, likes)
+            "INSERT INTO views (video_id, ts, views, likes) VALUES (%s, %s, %s, %s)",
+            (video_id, ts_utc, views_val, likes_val),
         )
 
-def process_gains(rows: list[dict]) -> list[tuple[str, int, int | None, int | None]]:
-    """
-    Input: rows (ASC by ts), single day.
-    Output: list of (ts_str, views, gain_5min, hourly_gain)
-    """
-    out = []
-    # Build lookup by timestamp for efficient hourly reference
-    by_ts = [r["ts"] for r in rows]
-    for idx, r in enumerate(rows):
-        ts = r["ts"]
-        views = r["views"]
-
-        # Gain since last poll (same day)
-        if idx == 0:
-            gain = None
-        else:
-            gain = views - rows[idx - 1]["views"]
-
-        # Hourly gain: diff vs most recent row at/just before ts-1h (same day)
-        target = ts - timedelta(hours=1)
-        # Find the rightmost ts <= target
-        ref_idx = None
-        for j in range(idx, -1, -1):
-            if rows[j]["ts"] <= target:
-                ref_idx = j
-                break
-        hourly = (views - rows[ref_idx]["views"]) if ref_idx is not None else None
-
-        out.append((ts.strftime("%Y-%m-%d %H:%M:%S"), views, gain, hourly))
-    return out
-
-# -----------------------------
-# Background Sampler (singleton)
-# -----------------------------
-_sampler_started = False
-_sampler_lock = threading.Lock()
-
-def _sleep_until_next_5_min_boundary():
-    """
-    Aligns to IST clock: 00, 05, 10, 15, ...
-    """
-    now = ist_now()
-    minute = now.minute
-    next_minute = ((minute // 5) + 1) * 5
-    if next_minute >= 60:
-        # Jump to next hour
-        next_time = now.replace(minute=0, second=0) + timedelta(hours=1)
-    else:
-        next_time = now.replace(minute=next_minute, second=0)
-    delta = (next_time - now).total_seconds()
-    time.sleep(max(1, delta))  # avoid zero/negative
-
-def _sampler_loop():
-    logger.info("Background sampler started (5-min cadence, IST).")
-    while True:
+def poll_once(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT video_id FROM video_list WHERE active = TRUE ORDER BY created_at ASC")
+        videos = [r[0] for r in cur.fetchall()]
+    if not videos:
+        return
+    ts_utc = ist_slot_to_utc()
+    for vid in videos:
+        stats = fetch_video_stats(vid)
+        if not stats:
+            app.logger.warning(f"Stats unavailable for {vid}; skipping this round.")
+            continue
+        _, views_val, likes_val = stats
         try:
-            _sleep_until_next_5_min_boundary()
-
-            # Get active videos
-            conn = get_db()
-            with conn.cursor() as cur:
-                cur.execute("SELECT video_id FROM video_list WHERE is_tracking=TRUE ORDER BY video_id")
-                rows = cur.fetchall()
-            video_ids = [r["video_id"] for r in rows]
-
-            if not video_ids:
-                continue
-
-            stats_map = fetch_views_batch(video_ids)
-            for vid in video_ids:
-                stats = stats_map.get(vid)
-                if stats:
-                    safe_store(vid, stats)
+            insert_snapshot(conn, vid, ts_utc, views_val, likes_val)
+            app.logger.info(f"Saved snapshot {vid} @ {ts_utc.isoformat()} views={views_val} likes={likes_val}")
         except Exception as e:
-            logger.exception("Sampler loop error: %s", e)
-            # brief backoff to avoid tight crash loops
-            time.sleep(5)
+            app.logger.exception(f"DB write failed for {vid}: {e}")
 
-def start_background():
-    global _sampler_started
-    with _sampler_lock:
-        if not _sampler_started:
-            t = threading.Thread(target=_sampler_loop, daemon=True, name="yt-tracker-sampler")
-            t.start()
-            _sampler_started = True
-            logger.info("Sampler thread started.")
+def tracker_loop():
+    app.logger.info("Tracker thread starting (per-iteration connection).")
+    while not stop_event.is_set():
+        try:
+            # Align to the next 5-minute boundary in IST
+            wait_sec = seconds_to_next_5min_boundary_IST()
+            if wait_sec > 0:
+                stop_event.wait(wait_sec)
+                if stop_event.is_set():
+                    break
 
-# -----------------------------
-# Routes
-# -----------------------------
+            # Borrow a connection just for this poll
+            with pool.connection(timeout=10) as conn:
+                # Advisory lock per iteration; released when conn closes
+                if not try_advisory_lock(conn):
+                    app.logger.debug("Tracker: lock not acquired this round (another instance is polling).")
+                else:
+                    poll_once(conn)
+
+            # Small buffer to avoid duplicate work on the same minute
+            stop_event.wait(2)
+
+        except Exception as e:
+            app.logger.exception(f"Tracker loop error: {e}")
+            # Backoff before retrying to avoid tight loops
+            stop_event.wait(10)
+
+    app.logger.info("Tracker thread stopped.")
+
+def start_tracker_thread():
+    global tracker_thread
+    if tracker_thread and tracker_thread.is_alive():
+        return
+    t = threading.Thread(target=tracker_loop, name="yt-tracker", daemon=True)
+    t.start()
+    tracker_thread = t
+
+# ---------------------- Flask Views ----------------------
 @app.route("/", methods=["GET"])
 def index():
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT video_id, name, is_tracking FROM video_list ORDER BY name")
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                video_id,
+                COALESCE(title, '(unknown)') AS title,
+                COALESCE(active, TRUE)       AS active,
+                COALESCE(created_at, NOW())  AS created_at
+            FROM video_list
+            ORDER BY created_at DESC
+        """)
         videos = cur.fetchall()
 
-    enriched = []
-    with conn.cursor() as cur:
-        for v in videos:
-            video_id = v["video_id"]
-            # Get distinct dates that have data for this video (newest first)
+        data_per_video = {}
+        for (vid, title, active, created_at) in videos:
             cur.execute(
-                "SELECT DISTINCT date FROM views WHERE video_id=%s ORDER BY date DESC",
-                (video_id,)
+                """
+                SELECT ts, views, likes
+                FROM views
+                WHERE video_id=%s
+                ORDER BY ts ASC
+                """,
+                (vid,),
             )
-            dates = [r["date"] for r in cur.fetchall()]
+            rows = cur.fetchall()
+            per_day = {}
+            last_view = None
+            ts_list = [r[0] for r in rows]
+            view_list = [r[1] for r in rows]
+            j = 0
+            for i, (ts, v, likes) in enumerate(rows):
+                # Display guard: ensure :00 seconds in IST
+                ts_ist = ts.astimezone(IST).replace(second=0, microsecond=0)
+                day_key = ts_ist.date().isoformat()
 
-            daily = {}
-            for d in dates:
-                cur.execute(
-                    "SELECT ts, views FROM views WHERE video_id=%s AND date=%s ORDER BY ts ASC",
-                    (video_id, d)
-                )
-                rows = cur.fetchall()
-                if not rows:
-                    continue
-                # Ensure Python datetime timezone-naive but IST-consistent (we stored naive IST)
-                # Already naive: ts is stored as naive local (IST-time) timestamps.
-                # Just pass through.
-                processed = process_gains(rows)
-                daily[d.strftime("%Y-%m-%d")] = processed
+                gain_5min = None if last_view is None else v - last_view
+                last_view = v
 
-            enriched.append({
-                "video_id": video_id,
-                "name": v["name"],
-                "is_tracking": bool(v["is_tracking"]),
-                "daily_data": daily
-            })
+                cutoff = ts - timedelta(hours=1)
+                while j < i and ts_list[j] < cutoff:
+                    j += 1
+                hourly_growth = None if j >= i else v - view_list[j]
 
-    return render_template("index.html", videos=enriched)
+                item = {
+                    "ts": ts_ist.strftime("%Y-%m-%d %H:%M:%S"),
+                    "views": v,
+                    "likes": likes,
+                    "gain5": gain_5min,
+                    "growth60": hourly_growth,
+                }
+                per_day.setdefault(day_key, []).append(item)
 
-@app.route("/add_video", methods=["POST"])
+            data_per_video[vid] = {
+                "video_id": vid,
+                "title": title,
+                "active": active,
+                "created_at": created_at.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+                "per_day": per_day,
+            }
+
+    return render_template("index.html", videos=data_per_video)
+
+@app.route("/add", methods=["POST"])
 def add_video():
-    link = (request.form.get("link") or "").strip()
-    if not link:
-        flash("Please paste a YouTube link.", "warning")
+    url = request.form.get("url", "").strip()
+    vid = extract_video_id(url)
+    if not vid:
+        flash("Invalid YouTube URL or ID.", "error")
         return redirect(url_for("index"))
 
-    video_id = extract_video_id(link)
-    if not video_id:
-        flash("Couldn't extract a valid YouTube video ID from that link.", "danger")
-        return redirect(url_for("index"))
-
-    title = fetch_video_title(video_id)
-    # Fetch immediate stats to start tracking with a first row
-    stats = fetch_views_batch([video_id]).get(video_id)
+    stats = fetch_video_stats(vid)
     if not stats:
-        flash("Could not fetch YouTube stats (check API key / quota / video availability).", "danger")
+        flash("Could not fetch video details from YouTube API.", "error")
         return redirect(url_for("index"))
+    title, views_val, likes_val = stats
 
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO video_list (video_id, name, is_tracking)
-            VALUES (%s, %s, TRUE)
-            ON CONFLICT (video_id) DO UPDATE SET name=EXCLUDED.name, is_tracking=TRUE
-        """, (video_id, title))
-
-    # Store first snapshot
     try:
-        safe_store(video_id, stats)
+        with pool.connection(timeout=10) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO video_list (video_id, title, active) VALUES (%s, %s, TRUE) "
+                "ON CONFLICT (video_id) DO UPDATE SET title=EXCLUDED.title",
+                (vid, title),
+            )
+            ts_utc = ist_slot_to_utc()
+            insert_snapshot(conn, vid, ts_utc, views_val, likes_val)
+        flash(f"Added: {title}", "success")
     except Exception as e:
-        logger.exception("Failed to store first snapshot for %s: %s", video_id, e)
+        app.logger.exception(f"Add video failed: {e}")
+        flash("Database error while adding video.", "error")
 
-    flash(f"Now tracking: {title}", "success")
     return redirect(url_for("index"))
 
-@app.route("/stop_tracking/<video_id>")
-def stop_tracking(video_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT is_tracking, name FROM video_list WHERE video_id=%s", (video_id,))
-        row = cur.fetchone()
-        if not row:
-            flash("Video not found.", "warning")
-            return redirect(url_for("index"))
-        new_state = not bool(row["is_tracking"])
-        cur.execute("UPDATE video_list SET is_tracking=%s WHERE video_id=%s", (new_state, video_id))
-        flash(("Resumed" if new_state else "Paused") + f" tracking: {row['name']}", "info")
+@app.route("/pause/<video_id>", methods=["POST"])
+def pause_video(video_id):
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE video_list SET active=FALSE WHERE video_id=%s", (video_id,))
+    flash("Tracking paused.", "info")
     return redirect(url_for("index"))
 
-@app.route("/remove_video/<video_id>")
+@app.route("/resume/<video_id>", methods=["POST"])
+def resume_video(video_id):
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE video_list SET active=TRUE WHERE video_id=%s", (video_id,))
+    flash("Tracking resumed.", "success")
+    return redirect(url_for("index"))
+
+@app.route("/remove/<video_id>", methods=["POST"])
 def remove_video(video_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT name FROM video_list WHERE video_id=%s", (video_id,))
-        row = cur.fetchone()
-        if not row:
-            flash("Video not found.", "warning")
-            return redirect(url_for("index"))
-        name = row["name"]
-        cur.execute("DELETE FROM views WHERE video_id=%s", (video_id,))
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM video_list WHERE video_id=%s", (video_id,))
-        flash(f"Removed '{name}' and all its historical data.", "success")
+    flash("Video and all historical data removed.", "warning")
     return redirect(url_for("index"))
 
-@app.route("/export/<video_id>")
-def export_video(video_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT name FROM video_list WHERE video_id=%s", (video_id,))
-        row = cur.fetchone()
-        if not row:
-            flash("Video not found.", "warning")
-            return redirect(url_for("index"))
-        name = row["name"]
+@app.route("/export/<video_id>.xlsx", methods=["GET"])
+def export_excel(video_id):
+    with pool.connection(timeout=10) as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT ts AT TIME ZONE 'Asia/Kolkata' AS ts_ist, views
+            FROM views
+            WHERE video_id=%s
+            ORDER BY ts ASC
+        """, (video_id,))
+        rows = cur.fetchall()
 
-        cur.execute("SELECT ts, views FROM views WHERE video_id=%s ORDER BY ts ASC", (video_id,))
-        data = cur.fetchall()
+        cur.execute("SELECT COALESCE(title, %s) FROM video_list WHERE video_id=%s", (video_id, video_id))
+        r = cur.fetchone()
+        title = r[0] if r else video_id
 
-    if not data:
-        flash("No data to export for this video yet.", "warning")
+    if not rows:
+        flash("No data to export for this video.", "error")
         return redirect(url_for("index"))
 
-    # Build DataFrame (Time as string in IST, Views)
-    df = pd.DataFrame([{
-        "Time": r["ts"].strftime("%Y-%m-%d %H:%M:%S"),
-        "Views": r["views"]
-    } for r in data])
+    df = pd.DataFrame(rows, columns=["Time (IST)", "Views"])
+    safe_title = re.sub(r"[^A-Za-z0-9 _-]+", "", title).strip().replace(" ", "_")
+    fname = f"{safe_title}_views.xlsx"
+    path = os.path.join("/tmp", fname)
+    df.to_excel(path, index=False)
 
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Views")
-    bio.seek(0)
-
-    safe_name = "".join(c for c in name if c.isalnum() or c in " _-").rstrip()
-    filename = f"{safe_name}_views.xlsx" if safe_name else "export_views.xlsx"
     return send_file(
-        bio,
+        path,
         as_attachment=True,
-        download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        download_name=fname,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# -----------------------------
-# App bootstrap
-# -----------------------------
-init_db()
-start_background()
+@app.route("/healthz")
+def healthz():
+    return {"ok": True, "time": datetime.now(IST).isoformat()}
+
+# ---------------------- Bootstrap (Flask 2.x/3.x safe) ----------------------
+BOOT_DONE = False
+def bootstrap():
+    global BOOT_DONE
+    if BOOT_DONE:
+        return
+    init_db()
+    if os.getenv("DISABLE_TRACKER", "0") != "1":
+        start_tracker_thread()
+    BOOT_DONE = True
+
+bootstrap()  # run at import so gunicorn workers are ready
+
+# ---------------------- Graceful shutdown ----------------------
+def _shutdown():
+    stop_event.set()
+    if tracker_thread and tracker_thread.is_alive():
+        tracker_thread.join(timeout=3)
+
+import atexit
+atexit.register(_shutdown)
 
 if __name__ == "__main__":
-    # For local dev: flask run or python app.py
+    bootstrap()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
