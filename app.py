@@ -1,3 +1,4 @@
+# Full app.py with 24h gain + export including new column
 import os
 import threading
 import logging
@@ -181,21 +182,36 @@ def safe_store(video_id: str, stats: dict):
 
 
 def process_gains(rows_asc: list[dict]):
+    """
+    Input: rows ascending by ts_utc.
+    Output: list of tuples per row:
+      (ts_ist_str, views, gain_5min, hourly_gain, gain_24h)
+    """
     out = []
     for i, r in enumerate(rows_asc):
         ts_ist = r["ts_utc"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
         views = r["views"]
         gain = None if i == 0 else views - rows_asc[i - 1]["views"]
 
-        # hourly gain
-        target = r["ts_utc"] - timedelta(hours=1)
-        ref_idx = None
+        # hourly gain vs latest row <= ts - 1h
+        target_h = r["ts_utc"] - timedelta(hours=1)
+        ref_idx_h = None
         for j in range(i, -1, -1):
-            if rows_asc[j]["ts_utc"] <= target:
-                ref_idx = j
+            if rows_asc[j]["ts_utc"] <= target_h:
+                ref_idx_h = j
                 break
-        hourly = None if ref_idx is None else (views - rows_asc[ref_idx]["views"])
-        out.append((ts_ist, views, gain, hourly))
+        hourly = None if ref_idx_h is None else (views - rows_asc[ref_idx_h]["views"])
+
+        # 24h gain vs latest row <= ts - 24h
+        target_d = r["ts_utc"] - timedelta(days=1)
+        ref_idx_d = None
+        for j in range(i, -1, -1):
+            if rows_asc[j]["ts_utc"] <= target_d:
+                ref_idx_d = j
+                break
+        gain_24h = None if ref_idx_d is None else (views - rows_asc[ref_idx_d]["views"])
+
+        out.append((ts_ist, views, gain, hourly, gain_24h))
     return out
 
 
@@ -267,7 +283,7 @@ def index():
         for v in videos:
             vid = v["video_id"]
 
-            # ---- daily data and %change (same as before) ----
+            # ---- daily data and %change (same as before, now with 24h gain) ----
             cur.execute(
                 "SELECT DISTINCT date_ist FROM views WHERE video_id=%s ORDER BY date_ist DESC", (vid,)
             )
@@ -282,8 +298,9 @@ def index():
                 asc_rows = cur.fetchall()
                 if not asc_rows:
                     continue
-                processed = process_gains(asc_rows)
+                processed = process_gains(asc_rows)  # tuples: ts, views, gain5, hourly, gain24
                 date_to_processed[d] = processed
+                # map by clock time (HH:MM:SS)
                 date_to_time_map[d] = {tpl[0].split(" ")[1]: tpl for tpl in processed}
 
             daily = {}
@@ -295,13 +312,17 @@ def index():
                 prev_map = date_to_time_map.get(prev_date, {})
                 display_rows = []
                 for tpl in processed:
-                    ts_ist, views, gain_5min, hourly_gain = tpl
-                    prev_tpl = prev_map.get(ts_ist.split(" ")[1])
+                    ts_ist, views, gain_5min, hourly_gain, gain_24h = tpl
+                    time_part = ts_ist.split(" ")[1]
+                    prev_tpl = prev_map.get(time_part)
                     prev_hourly = prev_tpl[3] if prev_tpl else None
+
                     pct = None
                     if prev_hourly not in (None, 0):
                         pct = round(((hourly_gain or 0) - prev_hourly) / prev_hourly * 100, 2)
-                    display_rows.append((ts_ist, views, gain_5min, hourly_gain, pct))
+
+                    # now row contains: ts, views, gain_5min, hourly_gain, gain_24h, pct
+                    display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct))
                 daily[d.strftime("%Y-%m-%d")] = list(reversed(display_rows))
 
             # ---- latest stats ----
@@ -464,16 +485,47 @@ def export_video(video_id):
             flash("Video not found.", "warning")
             return redirect(url_for("index"))
         name = row["name"]
+        # fetch asc rows and compute gains so export includes all columns
         cur.execute("SELECT ts_utc, views FROM views WHERE video_id=%s ORDER BY ts_utc ASC", (video_id,))
-        data = cur.fetchall()
-    if not data:
+        asc_rows = cur.fetchall()
+
+    if not asc_rows:
         flash("No data to export yet.", "warning")
         return redirect(url_for("index"))
 
-    df = pd.DataFrame([{
-        "Time (IST)": r["ts_utc"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
-        "Views": r["views"]
-    } for r in data])
+    processed = process_gains(asc_rows)  # (ts, views, gain5, hourly, gain24)
+
+    # Build percent change vs prev day (same rule used for page)
+    # Build a map of date -> time -> tpl to find prev-day hourly
+    date_map = {}
+    for tpl in processed:
+        date_str = tpl[0].split(" ")[0]
+        time_str = tpl[0].split(" ")[1]
+        date_map.setdefault(date_str, {})[time_str] = tpl
+
+    rows_for_df = []
+    for tpl in processed:
+        ts, views, gain5, hourly, gain24 = tpl
+        date_str = ts.split(" ")[0]
+        time_str = ts.split(" ")[1]
+        prev_date = (datetime.fromisoformat(date_str) - timedelta(days=1)).date().isoformat()
+        prev_map = date_map.get(prev_date, {})
+        prev_tpl = prev_map.get(time_str)
+        prev_hourly = prev_tpl[3] if prev_tpl else None
+        pct = None
+        if prev_hourly not in (None, 0):
+            pct = round(((hourly or 0) - prev_hourly) / prev_hourly * 100, 2)
+
+        rows_for_df.append({
+            "Time (IST)": ts,
+            "Views": views,
+            "Gain (5 min)": gain5 if gain5 is not None else "",
+            "Hourly Growth": hourly if hourly is not None else "",
+            "Gain (24 h)": gain24 if gain24 is not None else "",
+            "Change vs prev day (%)": pct if pct is not None else ""
+        })
+
+    df = pd.DataFrame(rows_for_df)
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
@@ -487,6 +539,7 @@ def export_video(video_id):
         download_name=f"{safe or 'export'}_views.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
 
 # Bootstrap
 init_db()
