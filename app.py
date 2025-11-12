@@ -252,10 +252,13 @@ def index():
                 "SELECT DISTINCT date_ist FROM views WHERE video_id=%s ORDER BY date_ist DESC",
                 (vid,)
             )
-            dates = [r["date_ist"] for r in cur.fetchall()]
-            daily = {}
+            dates = [r["date_ist"] for r in cur.fetchall()]  # list of date objects, desc
+
+            # Build processed data per date (chronological inside each date)
+            date_to_processed = {}  # date_obj -> list of tuples (ts_ist, views, gain_5min, hourly_gain)
+            date_to_time_map = {}   # date_obj -> { "HH:MM:SS" -> (ts_ist, views, gain_5min, hourly_gain) }
+
             for d in dates:
-                # get rows ASC to compute gains correctly
                 cur.execute(
                     "SELECT ts_utc, views FROM views WHERE video_id=%s AND date_ist=%s ORDER BY ts_utc ASC",
                     (vid, d)
@@ -263,9 +266,49 @@ def index():
                 asc_rows = cur.fetchall()
                 if not asc_rows:
                     continue
-                processed = process_gains(asc_rows)  # chronological
-                # display newest first
-                daily[d.strftime("%Y-%m-%d")] = list(reversed(processed))
+                processed = process_gains(asc_rows)  # list of (ts_ist, views, gain, hourly) chronological
+                date_to_processed[d] = processed
+
+                # map by clock time for easy 24h lookup (use IST time portion)
+                time_map = {}
+                for tpl in processed:
+                    ts_ist = tpl[0]  # "YYYY-MM-DD HH:MM:SS"
+                    time_part = ts_ist.split(" ")[1]
+                    time_map[time_part] = tpl
+                date_to_time_map[d] = time_map
+
+            # Now compute percent change vs same clock-time previous day using 'hourly' field
+            # We'll produce display-ready lists (newest first per date) where each row is:
+            # (ts_ist, views, gain_5min, hourly_gain, pct_vs_prev_day)
+            daily = {}
+            for d in dates:
+                if d not in date_to_processed:
+                    continue
+                processed = date_to_processed[d]
+                display_rows = []
+                prev_date = d - timedelta(days=1)
+                prev_map = date_to_time_map.get(prev_date, {})
+
+                for tpl in processed:
+                    ts_ist, views, gain_5min, hourly_gain = tpl
+                    time_part = ts_ist.split(" ")[1]
+                    prev_tpl = prev_map.get(time_part)
+                    prev_hourly = prev_tpl[3] if prev_tpl is not None else None
+
+                    pct = None
+                    # compute percent change only when previous hourly is not None and not zero
+                    if prev_hourly not in (None, 0):
+                        try:
+                            pct = round(((hourly_gain or 0) - prev_hourly) / prev_hourly * 100, 2)
+                        except Exception:
+                            pct = None
+
+                    # add tuple for front-end. newest first expected, so we'll reverse later
+                    display_rows.append((ts_ist, views, gain_5min, hourly_gain, pct))
+
+                # newest first for display (your template expects newest first)
+                daily[d.strftime("%Y-%m-%d")] = list(reversed(display_rows))
+
             enriched.append({
                 "video_id": vid,
                 "name": v["name"],
@@ -273,6 +316,7 @@ def index():
                 "daily_data": daily
             })
     return render_template("index.html", videos=enriched)
+
 
 @app.post("/add_video")
 def add_video():
