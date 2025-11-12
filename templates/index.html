@@ -18,14 +18,18 @@
     body{ background:#ffffff; color:var(--text-dark);}
     .card{ background:#fff; border:1px solid var(--border); }
     .badge.paused{ background:#adb5bd; }
-    .gain-pos{ background:var(--accent-green); padding:.1rem .4rem; border-radius:.25rem;}
-    .gain-neg{ background:var(--accent-red); padding:.1rem .4rem; border-radius:.25rem;}
+    .gain-pos{ background:var(--accent-green); padding:.1rem .4rem; border-radius:.25rem; display:inline-block; }
+    .gain-neg{ background:var(--accent-red); padding:.1rem .4rem; border-radius:.25rem; display:inline-block; }
     .gain-null{ color:var(--muted); }
     .muted{ color:var(--muted);}
     .tab-btn{ border:1px solid var(--border); background:#fff; }
     .tab-btn.active{ background:var(--accent-blue); }
     .table thead th{ color:#222; }
     .btn-outline-light{ border-color:var(--border); }
+    .pct-small{ font-weight:600; font-size:.95rem; }
+    .pct-arrow{ margin-right:.25rem; font-size:.85rem; vertical-align:middle; }
+    /* make numeric columns monospace-ish for alignment */
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace; }
   </style>
 </head>
 <body>
@@ -112,14 +116,16 @@
                           <th>Total Views</th>
                           <th>Gain (5 min)</th>
                           <th>Hourly Growth</th>
+                          <th>Change vs prev day (%)</th>
                         </tr>
                       </thead>
                       <tbody>
-                      {# rows are newest-first already #}
-                      {% for ts, views, gain, hourly in rows %}
+                      {# rows are newest-first already and now contain: ts, views, gain, hourly, pct #}
+                      {% for ts, views, gain, hourly, pct in rows %}
                         <tr>
-                          <td>{{ ts }}</td>
-                          <td>{{ "{:,}".format(views) }}</td>
+                          <td class="mono">{{ ts }}</td>
+                          <td class="mono">{{ "{:,}".format(views) }}</td>
+
                           <td>
                             {% if gain is none %}
                               <span class="gain-null">—</span>
@@ -131,6 +137,7 @@
                               {% endif %}
                             {% endif %}
                           </td>
+
                           <td>
                             {% if hourly is none %}
                               <span class="gain-null">—</span>
@@ -139,6 +146,20 @@
                                 <span class="gain-pos">+{{ "{:,}".format(hourly) }}</span>
                               {% else %}
                                 <span class="gain-neg">{{ "{:,}".format(hourly) }}</span>
+                              {% endif %}
+                            {% endif %}
+                          </td>
+
+                          <td>
+                            {% if pct is none %}
+                              <span class="gain-null">—</span>
+                            {% else %}
+                              {% if pct > 0 %}
+                                <span class="gain-pos pct-small"><span class="pct-arrow">▲</span>+{{ ('{:.2f}'.format(pct)) }}%</span>
+                              {% elif pct < 0 %}
+                                <span class="gain-neg pct-small"><span class="pct-arrow">▼</span>{{ ('{:.2f}'.format(pct)) }}%</span>
+                              {% else %}
+                                <span class="pct-small">0.00%</span>
                               {% endif %}
                             {% endif %}
                           </td>
@@ -158,7 +179,7 @@
   </div>
 
   <footer class="mt-4 mb-3 text-center muted">
-    Stored in PostgreSQL • UTC in DB, shown in IST • No graphs
+    Stored in PostgreSQL • UTC in DB, shown in IST • New column: percent change vs same clock-time previous day
   </footer>
 </div>
 
