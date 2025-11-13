@@ -402,9 +402,9 @@ def index():
                         # --- new: projected (min) views using EXACT yesterday 23:55 row ---
                         projected = None
                         # exact key for yesterday 23:55:00 (string)
-                        yesterday_2355 = prev_date_str + " 23:55:00"
+                        yesterday_2355 = prev_date_str + " 22:50:00"
                         # look up processed map for prev_date_str exactly at "23:55:00"
-                        prev_2355_tpl = prev_map.get("23:55:00")  # exact match only
+                        prev_2355_tpl = prev_map.get("22:50:00")  # exact match only
                         if prev_2355_tpl is not None and pct24 not in (None,):
                             prev_views_2355 = prev_2355_tpl[1]
                             prev_gain24_2355 = prev_2355_tpl[4]
