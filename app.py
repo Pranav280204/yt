@@ -1,6 +1,4 @@
-# (full file — same as the weighted-trend app.py you already have,
-#  with the new "min_reach" column logic added)
-
+# Full app.py with "Projected (min) views" column (uses exact yesterday 23:55 row)
 import os
 import threading
 import logging
@@ -218,7 +216,6 @@ def interpolate_views_at(rows_asc: list[dict], target_ts: datetime) -> Optional[
 
 
 def _time_to_seconds(time_str: str) -> int:
-    """Convert 'HH:MM:SS' to seconds since midnight."""
     h, m, s = [int(x) for x in time_str.split(":")]
     return h * 3600 + m * 60 + s
 
@@ -248,67 +245,12 @@ def find_closest_tpl(prev_map: dict, time_part: str, tolerance_seconds: int = 10
     return None
 
 
-def sum_prev_day_remaining_list(date_time_map: dict, prev_date_str: str, time_part: str, tolerance_seconds: int = 10):
-    """
-    Return ordered list of previous-day remaining slots (tuples): [(time_str, gain_5min), ...]
-    starting just after time_part up to midnight. This preserves per-slot gains so we can scale individually.
-    """
-    prev_map = date_time_map.get(prev_date_str, {})
-    if not prev_map:
-        return []
-
-    items = []
-    for t_str, tpl in prev_map.items():
-        try:
-            secs = _time_to_seconds(t_str)
-            items.append((secs, t_str, tpl))
-        except Exception:
-            continue
-    if not items:
-        return []
-    items.sort()
-
-    target_secs = _time_to_seconds(time_part)
-    start_idx = None
-
-    if time_part in prev_map:
-        for i, (s, ts_str, tpl) in enumerate(items):
-            if ts_str == time_part:
-                start_idx = i + 1
-                break
-    else:
-        # nearest within tolerance -> start after that slot
-        closest = None
-        best_delta = None
-        for i, (s, ts_str, tpl) in enumerate(items):
-            delta = abs(s - target_secs)
-            if best_delta is None or delta < best_delta:
-                closest = i
-                best_delta = delta
-        if best_delta is not None and best_delta <= tolerance_seconds:
-            start_idx = closest + 1
-        else:
-            for i, (s, ts_str, tpl) in enumerate(items):
-                if s > target_secs:
-                    start_idx = i
-                    break
-    if start_idx is None or start_idx >= len(items):
-        return []
-
-    out = []
-    for s, ts_str, tpl in items[start_idx:]:
-        gain_5min = tpl[2]  # (ts_ist, views, gain5, hourly, gain24, ...)
-        if gain_5min is None:
-            continue
-        out.append((ts_str, gain_5min))
-    return out
-
-
 def process_gains(rows_asc: list[dict]):
     """
     Input: rows ascending by ts_utc.
     Output: list of tuples:
       (ts_ist_str, views, gain_5min, hourly_gain, gain_24h)
+    24h gain uses interpolation when possible, otherwise falls back to latest <= target.
     """
     out = []
     for i, r in enumerate(rows_asc):
@@ -392,53 +334,6 @@ def start_background():
 
 
 # -----------------------------
-# Weighted regression helper (recent points get more weight)
-# -----------------------------
-def compute_weighted_trend(points: list[tuple[datetime, float]], ref_time: datetime, tau_hours: float = 6.0):
-    """
-    Weighted linear regression on (ts, pct) where ts <= ref_time.
-    - points: list of (ts_dt, pct) where ts_dt <= ref_time
-    - ref_time: datetime (tz-aware)
-    - tau_hours: decay constant in hours (recent points heavier)
-    Returns (intercept_at_ref_time, slope_percent_per_hour).
-    If insufficient points returns (last_pct_or_0, 0.0).
-    """
-    if not points:
-        return 0.0, 0.0
-    if len(points) == 1:
-        return points[0][1], 0.0
-
-    xs = []
-    ys = []
-    ws = []
-    for ts_dt, pct in points:
-        x = (ts_dt - ref_time).total_seconds() / 3600.0  # hours relative to ref_time, negative or zero
-        xs.append(x)
-        ys.append(pct)
-        w = math.exp(x / float(tau_hours))  # older points (x negative) get smaller weights
-        ws.append(w)
-
-    W = sum(ws)
-    if W == 0:
-        return 0.0, 0.0
-    x_mean = sum(w * x for w, x in zip(ws, xs)) / W
-    y_mean = sum(w * y for w, y in zip(ws, ys)) / W
-
-    num = 0.0
-    den = 0.0
-    for w, x, y in zip(ws, xs, ys):
-        dx = x - x_mean
-        num += w * dx * (y - y_mean)
-        den += w * (dx * dx)
-    if den == 0:
-        return y_mean, 0.0
-
-    slope = num / den  # percent per hour
-    intercept = y_mean - slope * x_mean  # pct at ref_time (x=0)
-    return intercept, slope
-
-
-# -----------------------------
 # Routes
 # -----------------------------
 @app.get("/healthz")
@@ -458,7 +353,7 @@ def index():
         for v in videos:
             vid = v["video_id"]
 
-            # fetch ALL rows for this video and process once
+            # ---------- fetch ALL rows for this video and process once ----------
             cur.execute("SELECT ts_utc, views FROM views WHERE video_id=%s ORDER BY ts_utc ASC", (vid,))
             all_rows = cur.fetchall()  # chronological ascending
 
@@ -476,25 +371,6 @@ def index():
                     grouped.setdefault(date_str, []).append(tpl)
                     date_time_map.setdefault(date_str, {})[time_part] = tpl
 
-                # build pct24 history for processed_all (for trend computation)
-                pct_history_map = {}  # ts_dt -> pct24 (for entries where computable)
-                for tpl in processed_all:
-                    ts_ist, views, gain5, hourly, gain24 = tpl
-                    date_str, time_part = ts_ist.split(" ")
-                    prev_date_str = (datetime.fromisoformat(date_str).date() - timedelta(days=1)).isoformat()
-                    prev_map = date_time_map.get(prev_date_str, {})
-                    prev_tpl = prev_map.get(time_part)
-                    if prev_tpl is None:
-                        prev_tpl = find_closest_tpl(prev_map, time_part, tolerance_seconds=10)
-                    prev_gain24 = prev_tpl[4] if prev_tpl else None
-                    if prev_gain24 not in (None, 0) and gain24 is not None:
-                        try:
-                            pct24 = round(((gain24 or 0) - prev_gain24) / prev_gain24 * 100, 6)
-                            ts_dt = datetime.fromisoformat(ts_ist).replace(tzinfo=IST)
-                            pct_history_map[ts_dt] = pct24
-                        except Exception:
-                            pass
-
                 # newest dates first
                 dates_sorted = sorted(grouped.keys(), reverse=True)
                 daily = {}
@@ -502,115 +378,48 @@ def index():
                     processed = grouped[date_str]  # chronological order within group
                     prev_date_obj = (datetime.fromisoformat(date_str).date() - timedelta(days=1))
                     prev_date_str = prev_date_obj.isoformat()
+                    prev_map = date_time_map.get(prev_date_str, {})
 
                     display_rows = []
                     for tpl in processed:
                         ts_ist, views, gain_5min, hourly_gain, gain_24h = tpl
                         time_part = ts_ist.split(" ")[1]
 
-                        # previous-day tuple (for immediate pct24)
-                        prev_map = date_time_map.get(prev_date_str, {})
-                        prev_tpl = prev_map.get(time_part)
-                        if prev_tpl is None:
-                            prev_tpl = find_closest_tpl(prev_map, time_part, tolerance_seconds=10)
-                        prev_gain24 = prev_tpl[4] if prev_tpl else None
+                        # find previous-day tuple allowing small time drift (tolerance) for pct24 matching
+                        prev_tpl_for_pct = prev_map.get(time_part)
+                        if prev_tpl_for_pct is None:
+                            prev_tpl_for_pct = find_closest_tpl(prev_map, time_part, tolerance_seconds=10)
+
+                        prev_gain24_for_pct = prev_tpl_for_pct[4] if prev_tpl_for_pct else None
 
                         pct24 = None
-                        if prev_gain24 not in (None, 0) and gain_24h is not None:
+                        if prev_gain24_for_pct not in (None, 0):
                             try:
-                                pct24 = round(((gain_24h or 0) - prev_gain24) / prev_gain24 * 100, 2)
+                                pct24 = round(((gain_24h or 0) - prev_gain24_for_pct) / prev_gain24_for_pct * 100, 2)
                             except Exception:
                                 pct24 = None
 
-                        # --- projection using weighted pct24 trend over past 24h ---
-                        proj_eod = None
-                        if pct24 is not None:
-                            # build list of historical (ts_dt, pct) for the past 24h relative to this row
-                            row_dt = datetime.fromisoformat(ts_ist).replace(tzinfo=IST)
-                            window_start = row_dt - timedelta(days=1)
-                            hist_points = []
-                            for hist_dt, hist_pct in pct_history_map.items():
-                                if hist_dt <= row_dt and hist_dt >= window_start:
-                                    hist_points.append((hist_dt, hist_pct))
-
-                            # compute weighted trend (intercept at row_dt, slope in %/hour)
-                            intercept_pct, slope = compute_weighted_trend(hist_points, row_dt, tau_hours=6.0)
-
-                            # get prev-day per-slot list (time_str, gain) for remainder of day
-                            prev_slots = sum_prev_day_remaining_list(date_time_map, prev_date_str, time_part, tolerance_seconds=10)
-                            if prev_slots:
-                                total_predicted_future = 0
-                                # choose best current pct estimate
-                                if row_dt in pct_history_map:
-                                    current_pct24_precise = pct_history_map[row_dt]
-                                else:
-                                    current_pct24_precise = intercept_pct
-                                # for each future slot, compute hours ahead and extrapolate pct24 using intercept+slope
-                                for slot_time_str, slot_gain in prev_slots:
-                                    slot_dt_today = datetime.fromisoformat(f"{date_str} {slot_time_str}").replace(tzinfo=IST)
-                                    if slot_dt_today <= row_dt:
-                                        slot_dt_today = slot_dt_today + timedelta(seconds=1)
-                                    hours_ahead = (slot_dt_today - row_dt).total_seconds() / 3600.0
-                                    predicted_pct24 = intercept_pct + slope * hours_ahead
-                                    m = 1.0 + (predicted_pct24 / 100.0)
-                                    if m < 0:
-                                        m = 0.0
-                                    predicted_gain = int(round(slot_gain * m))
-                                    total_predicted_future += predicted_gain
-                                proj_eod = (views or 0) + total_predicted_future
-                            else:
-                                # fallback: scale previous-day total remaining by current pct24
-                                prev_total = 0
-                                tmp_slots = sum_prev_day_remaining_list(date_time_map, prev_date_str, time_part, tolerance_seconds=10)
-                                for _, g in tmp_slots:
-                                    prev_total += g
-                                if prev_total > 0:
-                                    m = 1.0 + (pct24 / 100.0)
-                                    if m < 0:
-                                        m = 0.0
-                                    proj_eod = (views or 0) + int(round(prev_total * m))
-                                else:
-                                    proj_eod = None
-
-                        # --- NEW: compute min_reach using previous day's 23:55 gain_24h ---
-                        min_reach = None
-                        if pct24 is not None:
-                            # try to find prev_day 23:55 slot's gain_24h
-                            prev_map_for_23 = date_time_map.get(prev_date_str, {})
-                            # exact target time string
-                            target_2355 = "23:55:00"
-                            tpl_2355 = None
-                            if prev_map_for_23:
-                                tpl_2355 = prev_map_for_23.get(target_2355)
-                                if tpl_2355 is None:
-                                    # fallback to closest within tolerance (use 10s)
-                                    tpl_2355 = find_closest_tpl(prev_map_for_23, target_2355, tolerance_seconds=10)
-                                if tpl_2355 is None:
-                                    # final fallback: choose latest available slot (max time)
-                                    try:
-                                        latest_key = max(prev_map_for_23.keys(), key=lambda k: _time_to_seconds(k))
-                                        tpl_2355 = prev_map_for_23.get(latest_key)
-                                    except Exception:
-                                        tpl_2355 = None
-                            prev_2355_gain24 = tpl_2355[4] if tpl_2355 else None
-
-                            if prev_2355_gain24 not in (None, 0):
+                        # --- new: projected (min) views using EXACT yesterday 23:55 row ---
+                        projected = None
+                        # exact key for yesterday 23:55:00 (string)
+                        yesterday_2355 = prev_date_str + " 23:55:00"
+                        # look up processed map for prev_date_str exactly at "23:55:00"
+                        prev_2355_tpl = prev_map.get("23:55:00")  # exact match only
+                        if prev_2355_tpl is not None and pct24 not in (None,):
+                            prev_views_2355 = prev_2355_tpl[1]
+                            prev_gain24_2355 = prev_2355_tpl[4]
+                            if prev_views_2355 is not None and prev_gain24_2355 not in (None, 0):
                                 try:
-                                    m = 1.0 + (pct24 / 100.0)
-                                    # clamp multiplier to non-negative
-                                    if m < 0:
-                                        m = 0.0
-                                    add = int(round(prev_2355_gain24 * m))
-                                    min_reach = (views or 0) + add
+                                    projected_val = prev_views_2355 + prev_gain24_2355 * (1 + (pct24 / 100.0))
+                                    projected = int(round(projected_val))
                                 except Exception:
-                                    min_reach = None
-                        # append new row: (ts, views, gain5, hourly, gain24, pct24, proj_eod, min_reach)
-                        display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct24, proj_eod, min_reach))
+                                    projected = None
+                        # row: ts, views, gain5, hourly, gain24, pct24, projected
+                        display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct24, projected))
 
                     # newest-first for display
                     daily[date_str] = list(reversed(display_rows))
-
-            # end processing
+            # ---------- end fetch/process ----------
 
             # ---- latest stats ----
             latest_views = None
@@ -775,8 +584,11 @@ def export_video(video_id):
             flash("Video not found.", "warning")
             return redirect(url_for("index"))
         name = row["name"]
+        # fetch asc rows and compute gains so export includes all columns
         cur.execute("SELECT ts_utc, views FROM views WHERE video_id=%s ORDER BY ts_utc ASC", (video_id,))
         asc_rows = cur.fetchall()
+
+        # fetch targets for separate sheet
         cur.execute("SELECT id, target_views, target_ts, note FROM targets WHERE video_id=%s ORDER BY target_ts ASC", (video_id,))
         target_rows = cur.fetchall()
 
@@ -786,7 +598,7 @@ def export_video(video_id):
 
     processed = process_gains(asc_rows)  # (ts, views, gain5, hourly, gain24)
 
-    # date_map for prev-day lookups
+    # Build mapping date -> time -> tpl for prev-day lookups (pct and for exact 23:55)
     date_map = {}
     for tpl in processed:
         date_str = tpl[0].split(" ")[0]
@@ -794,98 +606,34 @@ def export_video(video_id):
         date_map.setdefault(date_str, {})[time_str] = tpl
 
     rows_for_df = []
-    # build pct_history_map for export usage
-    pct_history_map = {}
-    for ttpl in processed:
-        t_ts_ist = ttpl[0]
-        t_date, t_time = t_ts_ist.split(" ")
-        t_prev_date = (datetime.fromisoformat(t_date).date() - timedelta(days=1)).isoformat()
-        t_prev_map = date_map.get(t_prev_date, {})
-        t_prev_tpl = t_prev_map.get(t_time)
-        if t_prev_tpl is None:
-            t_prev_tpl = find_closest_tpl(t_prev_map, t_time, tolerance_seconds=10)
-        t_prev_gain24 = t_prev_tpl[4] if t_prev_tpl else None
-        if t_prev_gain24 not in (None, 0) and ttpl[4] is not None:
-            try:
-                p = round(((ttpl[4] or 0) - t_prev_gain24) / t_prev_gain24 * 100, 6)
-                t_dt = datetime.fromisoformat(t_ts_ist).replace(tzinfo=IST)
-                pct_history_map[t_dt] = p
-            except Exception:
-                pass
-
     for tpl in processed:
         ts, views, gain5, hourly, gain24 = tpl
         date_str = ts.split(" ")[0]
         time_str = ts.split(" ")[1]
         prev_date = (datetime.fromisoformat(date_str) - timedelta(days=1)).date().isoformat()
         prev_map = date_map.get(prev_date, {})
-        prev_tpl = prev_map.get(time_str)
-        if prev_tpl is None:
-            prev_tpl = find_closest_tpl(prev_map, time_str, tolerance_seconds=10)
-        prev_gain24 = prev_tpl[4] if prev_tpl else None
 
+        # pct24 using tolerance
+        prev_tpl_for_pct = prev_map.get(time_str)
+        if prev_tpl_for_pct is None:
+            prev_tpl_for_pct = find_closest_tpl(prev_map, time_str, tolerance_seconds=10)
+        prev_gain24_for_pct = prev_tpl_for_pct[4] if prev_tpl_for_pct else None
         pct24 = None
-        if prev_gain24 not in (None, 0) and gain24 is not None:
-            try:
-                pct24 = round(((gain24 or 0) - prev_gain24) / prev_gain24 * 100, 2)
-            except Exception:
-                pct24 = None
+        if prev_gain24_for_pct not in (None, 0):
+            pct24 = round(((gain24 or 0) - prev_gain24_for_pct) / prev_gain24_for_pct * 100, 2)
 
-        # compute projection for export using weighted trend
-        proj_eod = None
-        if pct24 is not None:
-            # build hist_points for this row
-            row_dt = datetime.fromisoformat(ts).replace(tzinfo=IST)
-            window_start = row_dt - timedelta(days=1)
-            hist_points = [(dt, p) for dt, p in pct_history_map.items() if dt <= row_dt and dt >= window_start]
-            intercept_pct, slope = compute_weighted_trend(hist_points, row_dt, tau_hours=6.0)
-
-            prev_slots = sum_prev_day_remaining_list(date_map, prev_date, time_str, tolerance_seconds=10)
-            if prev_slots:
-                if row_dt in pct_history_map:
-                    current_pct24_precise = pct_history_map[row_dt]
-                else:
-                    current_pct24_precise = intercept_pct
-                total_predicted_future = 0
-                for slot_time_str, slot_gain in prev_slots:
-                    slot_dt_today = datetime.fromisoformat(f"{date_str} {slot_time_str}").replace(tzinfo=IST)
-                    if slot_dt_today <= row_dt:
-                        slot_dt_today = slot_dt_today + timedelta(seconds=1)
-                    hours_ahead = (slot_dt_today - row_dt).total_seconds() / 3600.0
-                    predicted_pct24 = intercept_pct + slope * hours_ahead
-                    m = 1.0 + (predicted_pct24 / 100.0)
-                    if m < 0:
-                        m = 0.0
-                    predicted_gain = int(round(slot_gain * m))
-                    total_predicted_future += predicted_gain
-                proj_eod = (views or 0) + total_predicted_future
-
-        # compute min_reach for export (same logic)
-        min_reach = None
-        if pct24 is not None:
-            prev_map_for_23 = date_map.get(prev_date, {})
-            target_2355 = "23:55:00"
-            tpl_2355 = None
-            if prev_map_for_23:
-                tpl_2355 = prev_map_for_23.get(target_2355)
-                if tpl_2355 is None:
-                    tpl_2355 = find_closest_tpl(prev_map_for_23, target_2355, tolerance_seconds=10)
-                if tpl_2355 is None:
-                    try:
-                        latest_key = max(prev_map_for_23.keys(), key=lambda k: _time_to_seconds(k))
-                        tpl_2355 = prev_map_for_23.get(latest_key)
-                    except Exception:
-                        tpl_2355 = None
-            prev_2355_gain24 = tpl_2355[4] if tpl_2355 else None
-            if prev_2355_gain24 not in (None, 0):
+        # projected using exact yesterday 23:55 row (exact match only)
+        projected = None
+        prev_2355_tpl = prev_map.get("23:55:00")
+        if prev_2355_tpl is not None and pct24 not in (None,):
+            prev_views_2355 = prev_2355_tpl[1]
+            prev_gain24_2355 = prev_2355_tpl[4]
+            if prev_views_2355 is not None and prev_gain24_2355 not in (None, 0):
                 try:
-                    m = 1.0 + (pct24 / 100.0)
-                    if m < 0:
-                        m = 0.0
-                    add = int(round(prev_2355_gain24 * m))
-                    min_reach = (views or 0) + add
+                    projected_val = prev_views_2355 + prev_gain24_2355 * (1 + (pct24 / 100.0))
+                    projected = int(round(projected_val))
                 except Exception:
-                    min_reach = None
+                    projected = None
 
         rows_for_df.append({
             "Time (IST)": ts,
@@ -894,13 +642,12 @@ def export_video(video_id):
             "Hourly Growth": hourly if hourly is not None else "",
             "Gain (24 h)": gain24 if gain24 is not None else "",
             "Change 24h vs prev day (%)": pct24 if pct24 is not None else "",
-            "Projected EOD": proj_eod if proj_eod is not None else "",
-            "Min reach (based on prev day's 23:55)": min_reach if min_reach is not None else ""
+            "Projected (min) views": projected if projected is not None else ""
         })
 
     df_views = pd.DataFrame(rows_for_df)
 
-    # targets sheet
+    # Build targets sheet data
     nowu = now_utc()
     targets_rows_for_df = []
     for t in target_rows:
