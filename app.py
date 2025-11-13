@@ -353,41 +353,39 @@ def index():
         for v in videos:
             vid = v["video_id"]
 
-            # ---------- fetch ALL rows for this video ----------
+            # ---------- fetch ALL rows for this video and process once ----------
             cur.execute("SELECT ts_utc, views FROM views WHERE video_id=%s ORDER BY ts_utc ASC", (vid,))
-            all_rows = cur.fetchall()
+            all_rows = cur.fetchall()  # chronological ascending
 
             if not all_rows:
                 daily = {}
             else:
-                processed_all = process_gains(all_rows)
+                processed_all = process_gains(all_rows)  # list of (ts_ist, views, gain5, hourly, gain24)
 
-                # group by date
+                # group processed_all by IST date string "YYYY-MM-DD"
                 grouped = {}
                 date_time_map = {}
                 for tpl in processed_all:
-                    ts_ist = tpl[0]
-                    d, t = ts_ist.split(" ")
-                    grouped.setdefault(d, []).append(tpl)
-                    date_time_map.setdefault(d, {})[t] = tpl
+                    ts_ist = tpl[0]  # "YYYY-MM-DD HH:MM:SS"
+                    date_str, time_part = ts_ist.split(" ")
+                    grouped.setdefault(date_str, []).append(tpl)
+                    date_time_map.setdefault(date_str, {})[time_part] = tpl
 
+                # newest dates first
                 dates_sorted = sorted(grouped.keys(), reverse=True)
                 daily = {}
-
                 for date_str in dates_sorted:
-                    processed = grouped[date_str]
-
+                    processed = grouped[date_str]  # chronological order within group
                     prev_date_obj = (datetime.fromisoformat(date_str).date() - timedelta(days=1))
                     prev_date_str = prev_date_obj.isoformat()
                     prev_map = date_time_map.get(prev_date_str, {})
 
                     display_rows = []
-
                     for tpl in processed:
-                        ts_ist, views, gain_5, hourly_gain, gain24 = tpl
+                        ts_ist, views, gain_5min, hourly_gain, gain_24h = tpl
                         time_part = ts_ist.split(" ")[1]
 
-                        # --- find prev-day row within tolerance for pct24 ---
+                        # find previous-day tuple allowing small time drift (tolerance) for pct24 matching
                         prev_tpl_for_pct = prev_map.get(time_part)
                         if prev_tpl_for_pct is None:
                             prev_tpl_for_pct = find_closest_tpl(prev_map, time_part, tolerance_seconds=10)
@@ -397,106 +395,74 @@ def index():
                         pct24 = None
                         if prev_gain24_for_pct not in (None, 0):
                             try:
-                                pct24 = round(((gain24 or 0) - prev_gain24_for_pct)
-                                              / prev_gain24_for_pct * 100, 2)
-                            except:
+                                pct24 = round(((gain_24h or 0) - prev_gain24_for_pct) / prev_gain24_for_pct * 100, 2)
+                            except Exception:
                                 pct24 = None
 
-                        # --------- PROJECTED EOD (existing logic) ----------
+                        # --- new: projected (min) views using EXACT yesterday 23:55 row ---
                         projected = None
-                        prev_2355 = prev_map.get("23:55:00")
-                        if prev_2355 and pct24 not in (None,):
-                            try:
-                                base_views = prev_2355[1]
-                                base_gain24 = prev_2355[4]
-                                if base_gain24 not in (None, 0):
-                                    projected_val = base_views + base_gain24 * (1 + pct24 / 100)
+                        # exact key for yesterday 23:55:00 (string)
+                        yesterday_2355 = prev_date_str + " 23:55:00"
+                        # look up processed map for prev_date_str exactly at "23:55:00"
+                        prev_2355_tpl = prev_map.get("23:55:00")  # exact match only
+                        if prev_2355_tpl is not None and pct24 not in (None,):
+                            prev_views_2355 = prev_2355_tpl[1]
+                            prev_gain24_2355 = prev_2355_tpl[4]
+                            if prev_views_2355 is not None and prev_gain24_2355 not in (None, 0):
+                                try:
+                                    projected_val = prev_views_2355 + prev_gain24_2355 * (1 + (pct24 / 100.0))
                                     projected = int(round(projected_val))
-                            except:
-                                projected = None
+                                except Exception:
+                                    projected = None
+                        # row: ts, views, gain5, hourly, gain24, pct24, projected
+                        display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct24, projected))
 
-                        # --------- MIN_REACH (NEW FORMULA) ----------
-                        # Yesterday 23:55 gain24 * (1 + pct24/100) + yesterday 11:55 views
-                        min_reach = None
-                        if pct24 not in (None,):
-
-                            # find yesterday 23:55
-                            prev_2355 = prev_map.get("23:55:00")
-                            # find yesterday 11:55
-                            prev_1155 = prev_map.get("11:55:00")
-
-                            # tolerance fallback
-                            if prev_2355 is None:
-                                prev_2355 = find_closest_tpl(prev_map, "23:55:00", tolerance_seconds=10)
-                            if prev_1155 is None:
-                                prev_1155 = find_closest_tpl(prev_map, "11:55:00", tolerance_seconds=10)
-
-                            if prev_2355 and prev_1155:
-                                prev_gain24_2355 = prev_2355[4]
-                                prev_views_1155 = prev_1155[1]
-
-                                if prev_gain24_2355 not in (None, 0) and prev_views_1155 is not None:
-                                    try:
-                                        scaled_gain = prev_gain24_2355 * (1 + pct24 / 100)
-                                        min_reach = int(round(prev_views_1155 + scaled_gain))
-                                    except:
-                                        min_reach = None
-
-                        # ----- append row: EXACT 8 VALUES -----
-                        display_rows.append(
-                            (ts_ist, views, gain_5, hourly_gain, gain24, pct24, projected, min_reach)
-                        )
-
+                    # newest-first for display
                     daily[date_str] = list(reversed(display_rows))
+            # ---------- end fetch/process ----------
 
-            # ---------- FINAL NORMALIZATION TO 8 FIELDS ----------
-            for dkey, rows_list in list(daily.items()):
-                fixed = []
-                for r in rows_list:
-                    rl = list(r)
-                    if len(rl) < 8: rl += [None] * (8 - len(rl))
-                    if len(rl) > 8: rl = rl[:8]
-                    fixed.append(tuple(rl))
-                daily[dkey] = fixed
+            # ---- latest stats ----
+            latest_views = None
+            latest_ts = None
+            if all_rows:
+                last_row = all_rows[-1]
+                latest_views = last_row["views"]
+                latest_ts = last_row["ts_utc"]
 
-            # ---------- latest ----------
-            latest_views = all_rows[-1]["views"] if all_rows else None
-            latest_ts = all_rows[-1]["ts_utc"] if all_rows else None
-
-            # ---------- targets ----------
+            # ---- targets ----
             cur.execute("SELECT id, target_views, target_ts, note FROM targets WHERE video_id=%s ORDER BY target_ts ASC", (vid,))
-            trows = cur.fetchall()
-
+            target_rows = cur.fetchall()
             nowu = now_utc()
-            target_display = []
-            for t in trows:
-                tid, tviews, tts, note = t["id"], t["target_views"], t["target_ts"], t["note"]
-                remaining = tviews - (latest_views or 0)
-                seconds = (tts - nowu).total_seconds()
+            targets_display = []
 
-                if remaining <= 0:
+            for t in target_rows:
+                tid, t_views, t_ts, note = t["id"], t["target_views"], t["target_ts"], t["note"]
+                remaining_views = (t_views - (latest_views or 0))
+                remaining_seconds = (t_ts - nowu).total_seconds()
+
+                if remaining_views <= 0:
                     status = "reached"
-                    req_hr = req_5 = 0
-                elif seconds <= 0:
+                    req_hr = req_5m = 0
+                elif remaining_seconds <= 0:
                     status = "overdue"
-                    req_hr = math.ceil(remaining)
-                    req_5 = math.ceil(req_hr / 12)
+                    req_hr = math.ceil(remaining_views)
+                    req_5m = math.ceil(req_hr / 12)
                 else:
                     status = "active"
-                    hrs = seconds / 3600
-                    req_hr = math.ceil(remaining / hrs)
-                    req_5 = math.ceil(req_hr / 12)
+                    hrs = max(remaining_seconds / 3600.0, 1/3600)
+                    req_hr = math.ceil(remaining_views / hrs)
+                    req_5m = math.ceil(req_hr / 12)
 
-                target_display.append({
+                targets_display.append({
                     "id": tid,
-                    "target_views": tviews,
-                    "target_ts_ist": tts.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+                    "target_views": t_views,
+                    "target_ts_ist": t_ts.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
                     "note": note,
                     "status": status,
                     "required_per_hour": req_hr,
-                    "required_per_5min": req_5,
-                    "remaining_views": remaining,
-                    "remaining_seconds": int(seconds)
+                    "required_per_5min": req_5m,
+                    "remaining_views": remaining_views,
+                    "remaining_seconds": int(remaining_seconds)
                 })
 
             enriched.append({
@@ -504,13 +470,11 @@ def index():
                 "name": v["name"],
                 "is_tracking": bool(v["is_tracking"]),
                 "daily_data": daily,
-                "targets": target_display,
+                "targets": targets_display,
                 "latest_views": latest_views,
                 "latest_ts": latest_ts
             })
-
     return render_template("index.html", videos=enriched)
-
 
 
 @app.post("/add_video")
