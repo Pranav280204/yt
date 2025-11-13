@@ -399,10 +399,8 @@ def index():
                             except Exception:
                                 pct24 = None
 
-                        # --- new: projected (min) views using EXACT yesterday 23:55 row ---
+                        # --- new: projected (min) views using EXACT yesterday 23:55 row (existing logic) ---
                         projected = None
-                        # exact key for yesterday 23:55:00 (string)
-                        yesterday_2355 = prev_date_str + " 23:55:00"
                         # look up processed map for prev_date_str exactly at "23:55:00"
                         prev_2355_tpl = prev_map.get("23:55:00")  # exact match only
                         if prev_2355_tpl is not None and pct24 not in (None,):
@@ -414,12 +412,28 @@ def index():
                                     projected = int(round(projected_val))
                                 except Exception:
                                     projected = None
-                        # row: ts, views, gain5, hourly, gain24, pct24, projected
-                        display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct24, projected))
+
+                        # min_reach placeholder (kept for future use / to ensure tuple length)
+                        min_reach = None
+
+                        # row: ts, views, gain5, hourly, gain24, pct24, projected, min_reach
+                        display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct24, projected, min_reach))
 
                     # newest-first for display
                     daily[date_str] = list(reversed(display_rows))
-            # ---------- end fetch/process ----------
+
+            # ---------- ensure every row tuple has exactly 8 items (safety normalize) ----------
+            for date_key, rows_list in list(daily.items()):
+                normalized = []
+                for r in rows_list:
+                    rl = list(r)
+                    if len(rl) < 8:
+                        rl += [None] * (8 - len(rl))
+                    elif len(rl) > 8:
+                        rl = rl[:8]
+                    normalized.append(tuple(rl))
+                daily[date_key] = normalized
+            # ---------- end normalization ----------
 
             # ---- latest stats ----
             latest_views = None
@@ -475,6 +489,7 @@ def index():
                 "latest_ts": latest_ts
             })
     return render_template("index.html", videos=enriched)
+
 
 
 @app.post("/add_video")
