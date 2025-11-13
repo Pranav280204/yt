@@ -86,7 +86,7 @@
                 <a class="btn btn-sm btn-outline-warning" href="{{ url_for('stop_tracking', video_id=v.video_id) }}">
                   {% if v.is_tracking %}Pause{% else %}Resume{% endif %}
                 </a>
-                <a class="btn btn-sm btn-outline-danger" href="{{ url_for('remove_video', video_id=v.video_id) }}" onclick="return confirm('Delete this video and ALL its data?')">Remove</a>
+                <a class="btn class="btn btn-sm btn-outline-danger" href="{{ url_for('remove_video', video_id=v.video_id) }}" onclick="return confirm('Delete this video and ALL its data?')">Remove</a>
               </div>
             </div>
 
@@ -165,10 +165,11 @@
                           </th>
                           <th>Change 24h vs prev day (%)</th>
                           <th>Projected EOD</th>
+                          <th>Min reach (based on prev day's 23:55)</th>
                         </tr>
                       </thead>
                       <tbody>
-                      {% for ts, views, gain, hourly, gain24, pct24, proj_eod in rows %}
+                      {% for ts, views, gain, hourly, gain24, pct24, proj_eod, min_reach in rows %}
                         <tr>
                           <td class="mono">{{ ts }}</td>
                           <td class="mono">{{ "{:,}".format(views) }}</td>
@@ -217,6 +218,13 @@
                               {{ "{:,}".format(proj_eod) }}
                             {% endif %}
                           </td>
+                          <td class="mono">
+                            {% if min_reach is none %}
+                              <span class="gain-null">—</span>
+                            {% else %}
+                              {{ "{:,}".format(min_reach) }}
+                            {% endif %}
+                          </td>
                         </tr>
                       {% endfor %}
                       </tbody>
@@ -233,7 +241,7 @@
   </div>
 
   <footer class="mt-4 mb-3 text-center muted">
-    Stored in PostgreSQL • UTC in DB, shown in IST • Projection uses pct24 trend (past 24h) extrapolated per-slot; 10s tolerance.
+    Stored in PostgreSQL • UTC in DB, shown in IST • Projection uses pct24 trend (past 24h) extrapolated per-slot; min reach uses prev day's 23:55 gain_24h scaled by pct24.
   </footer>
 </div>
 
