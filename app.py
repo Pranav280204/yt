@@ -1,4 +1,3 @@
-# (Full app.py updated — includes pct24 computation and export)
 import os
 import threading
 import logging
@@ -70,6 +69,7 @@ def db():
 
 
 def init_db():
+    """Schema: store timestamps in UTC (timestamptz). Compute IST date on insert."""
     conn = db()
     with conn.cursor() as cur:
         cur.execute("""
@@ -180,16 +180,24 @@ def safe_store(video_id: str, stats: dict):
 
 
 def interpolate_views_at(rows_asc: list[dict], target_ts: datetime) -> Optional[float]:
+    """
+    Return interpolated views at target_ts (tz-aware). If exact match exists return that value.
+    If target_ts < first ts or > last ts return None.
+    Interpolation between bracketing samples (linear in time).
+    """
     if not rows_asc:
         return None
+    # exact match
     for r in rows_asc:
         if r["ts_utc"] == target_ts:
             return float(r["views"])
+    # find bracketing indices
     prev = None
     for r in rows_asc:
         if r["ts_utc"] < target_ts:
             prev = r
             continue
+        # r.ts_utc >= target_ts
         if r["ts_utc"] > target_ts and prev is not None:
             t0 = prev["ts_utc"].timestamp()
             v0 = float(prev["views"])
@@ -199,12 +207,112 @@ def interpolate_views_at(rows_asc: list[dict], target_ts: datetime) -> Optional[
                 return v1
             frac = (target_ts.timestamp() - t0) / (t1 - t0)
             return v0 + frac * (v1 - v0)
+        # prev is None and r.ts_utc >= target_ts -> target before first sample
         if prev is None:
             return None
+    # target after last sample -> None
     return None
 
 
+def _time_to_seconds(time_str: str) -> int:
+    """Convert 'HH:MM:SS' to seconds since midnight."""
+    h, m, s = [int(x) for x in time_str.split(":")]
+    return h * 3600 + m * 60 + s
+
+
+def find_closest_tpl(prev_map: dict, time_part: str, tolerance_seconds: int = 10):
+    """
+    prev_map: mapping time_str -> tpl
+    time_part: 'HH:MM:SS' string to match
+    returns tpl with minimal abs(second-diff) if within tolerance, else None
+    """
+    if not prev_map:
+        return None
+    target_secs = _time_to_seconds(time_part)
+    best = None
+    best_delta = None
+    for k, tpl in prev_map.items():
+        try:
+            s = _time_to_seconds(k)
+        except Exception:
+            continue
+        delta = abs(target_secs - s)
+        if best is None or delta < best_delta:
+            best = tpl
+            best_delta = delta
+    if best is not None and best_delta is not None and best_delta <= tolerance_seconds:
+        return best
+    return None
+
+
+def sum_prev_day_remaining_gains(date_time_map: dict, prev_date_str: str, time_part: str, tolerance_seconds: int = 10):
+    """
+    Sum the remaining 5-min gains on prev_date from just after `time_part` up to midnight.
+    date_time_map: { date_str: { time_str: tpl, ... }, ... }
+    tpl structure used elsewhere: (ts_ist, views, gain_5min, hourly, gain_24h, ...)
+    Returns integer sum (0 if none).
+    """
+    prev_map = date_time_map.get(prev_date_str, {})
+    if not prev_map:
+        return 0
+
+    # collect times as seconds and sort ascending
+    items = []
+    for t_str, tpl in prev_map.items():
+        try:
+            secs = _time_to_seconds(t_str)
+            items.append((secs, t_str, tpl))
+        except Exception:
+            continue
+    if not items:
+        return 0
+    items.sort()
+
+    target_secs = _time_to_seconds(time_part)
+    start_idx = None
+
+    # If exact key exists start after it
+    if time_part in prev_map:
+        for i, (s, ts_str, tpl) in enumerate(items):
+            if ts_str == time_part:
+                start_idx = i + 1
+                break
+    else:
+        # try nearest within tolerance
+        closest = None
+        best_delta = None
+        for i, (s, ts_str, tpl) in enumerate(items):
+            delta = abs(s - target_secs)
+            if best_delta is None or delta < best_delta:
+                closest = i
+                best_delta = delta
+        if best_delta is not None and best_delta <= tolerance_seconds:
+            start_idx = closest + 1
+        else:
+            # start at first item with secs > target_secs
+            for i, (s, ts_str, tpl) in enumerate(items):
+                if s > target_secs:
+                    start_idx = i
+                    break
+    if start_idx is None or start_idx >= len(items):
+        return 0
+
+    total = 0
+    for s, ts_str, tpl in items[start_idx:]:
+        gain_5min = tpl[2]  # per-tpl structure: (ts_ist, views, gain_5min, hourly, gain_24h, ...)
+        if gain_5min is None:
+            continue
+        total += gain_5min
+    return total
+
+
 def process_gains(rows_asc: list[dict]):
+    """
+    Input: rows ascending by ts_utc.
+    Output: list of tuples:
+      (ts_ist_str, views, gain_5min, hourly_gain, gain_24h)
+    24h gain uses interpolation when possible, otherwise falls back to latest <= target.
+    """
     out = []
     for i, r in enumerate(rows_asc):
         ts_utc = r["ts_utc"]
@@ -212,6 +320,7 @@ def process_gains(rows_asc: list[dict]):
         views = r["views"]
         gain = None if i == 0 else views - rows_asc[i - 1]["views"]
 
+        # hourly: latest row <= ts - 1h
         target_h = ts_utc - timedelta(hours=1)
         ref_idx_h = None
         for j in range(i, -1, -1):
@@ -220,6 +329,7 @@ def process_gains(rows_asc: list[dict]):
                 break
         hourly = None if ref_idx_h is None else (views - rows_asc[ref_idx_h]["views"])
 
+        # 24h: try interpolation first, fallback to latest <= target
         target_d = ts_utc - timedelta(days=1)
         interp = interpolate_views_at(rows_asc, target_d)
         if interp is None:
@@ -304,26 +414,29 @@ def index():
         for v in videos:
             vid = v["video_id"]
 
-            # fetch all rows once
+            # ---------- fetch ALL rows for this video and process once ----------
             cur.execute("SELECT ts_utc, views FROM views WHERE video_id=%s ORDER BY ts_utc ASC", (vid,))
-            all_rows = cur.fetchall()
+            all_rows = cur.fetchall()  # chronological ascending
 
             if not all_rows:
                 daily = {}
             else:
-                processed_all = process_gains(all_rows)  # (ts, views, gain5, hourly, gain24)
+                processed_all = process_gains(all_rows)  # list of (ts_ist, views, gain5, hourly, gain24)
+
+                # group processed_all by IST date string "YYYY-MM-DD"
                 grouped = {}
                 date_time_map = {}
                 for tpl in processed_all:
-                    ts_ist = tpl[0]
+                    ts_ist = tpl[0]  # "YYYY-MM-DD HH:MM:SS"
                     date_str, time_part = ts_ist.split(" ")
                     grouped.setdefault(date_str, []).append(tpl)
                     date_time_map.setdefault(date_str, {})[time_part] = tpl
 
+                # newest dates first
                 dates_sorted = sorted(grouped.keys(), reverse=True)
                 daily = {}
                 for date_str in dates_sorted:
-                    processed = grouped[date_str]
+                    processed = grouped[date_str]  # chronological order within group
                     prev_date_obj = (datetime.fromisoformat(date_str).date() - timedelta(days=1))
                     prev_date_str = prev_date_obj.isoformat()
                     prev_map = date_time_map.get(prev_date_str, {})
@@ -332,16 +445,13 @@ def index():
                     for tpl in processed:
                         ts_ist, views, gain_5min, hourly_gain, gain_24h = tpl
                         time_part = ts_ist.split(" ")[1]
-                        prev_tpl = prev_map.get(time_part)
-                        prev_hourly = prev_tpl[3] if prev_tpl else None
-                        prev_gain24 = prev_tpl[4] if prev_tpl else None
 
-                        pct = None
-                        if prev_hourly not in (None, 0):
-                            try:
-                                pct = round(((hourly_gain or 0) - prev_hourly) / prev_hourly * 100, 2)
-                            except Exception:
-                                pct = None
+                        # find previous-day tuple allowing small time drift (tolerance)
+                        prev_tpl = prev_map.get(time_part)
+                        if prev_tpl is None:
+                            prev_tpl = find_closest_tpl(prev_map, time_part, tolerance_seconds=10)
+
+                        prev_gain24 = prev_tpl[4] if prev_tpl else None
 
                         pct24 = None
                         if prev_gain24 not in (None, 0):
@@ -350,11 +460,24 @@ def index():
                             except Exception:
                                 pct24 = None
 
-                        display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct, pct24))
+                        # compute projection using prev-day remaining scaled by pct24
+                        proj_remaining = None
+                        proj_eod = None
+                        if pct24 is not None:
+                            m = 1.0 + (pct24 / 100.0)
+                            sum_prev_remaining = sum_prev_day_remaining_gains(date_time_map, prev_date_str, time_part, tolerance_seconds=10)
+                            if sum_prev_remaining > 0:
+                                proj_remaining = int(round(sum_prev_remaining * m))
+                                proj_eod = (views or 0) + proj_remaining
 
+                        # row: ts, views, gain5, hourly, gain24, pct24, proj_remaining, proj_eod
+                        display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct24, proj_remaining, proj_eod))
+
+                    # newest-first for display
                     daily[date_str] = list(reversed(display_rows))
+            # ---------- end fetch/process ----------
 
-            # latest stats
+            # ---- latest stats ----
             latest_views = None
             latest_ts = None
             if all_rows:
@@ -362,15 +485,17 @@ def index():
                 latest_views = last_row["views"]
                 latest_ts = last_row["ts_utc"]
 
-            # targets
+            # ---- targets ----
             cur.execute("SELECT id, target_views, target_ts, note FROM targets WHERE video_id=%s ORDER BY target_ts ASC", (vid,))
             target_rows = cur.fetchall()
             nowu = now_utc()
             targets_display = []
+
             for t in target_rows:
                 tid, t_views, t_ts, note = t["id"], t["target_views"], t["target_ts"], t["note"]
                 remaining_views = (t_views - (latest_views or 0))
                 remaining_seconds = (t_ts - nowu).total_seconds()
+
                 if remaining_views <= 0:
                     status = "reached"
                     req_hr = req_5m = 0
@@ -515,8 +640,11 @@ def export_video(video_id):
             flash("Video not found.", "warning")
             return redirect(url_for("index"))
         name = row["name"]
+        # fetch asc rows and compute gains so export includes all columns
         cur.execute("SELECT ts_utc, views FROM views WHERE video_id=%s ORDER BY ts_utc ASC", (video_id,))
         asc_rows = cur.fetchall()
+
+        # fetch targets for separate sheet
         cur.execute("SELECT id, target_views, target_ts, note FROM targets WHERE video_id=%s ORDER BY target_ts ASC", (video_id,))
         target_rows = cur.fetchall()
 
@@ -526,6 +654,7 @@ def export_video(video_id):
 
     processed = process_gains(asc_rows)  # (ts, views, gain5, hourly, gain24)
 
+    # Build date_map for prev-day lookups
     date_map = {}
     for tpl in processed:
         date_str = tpl[0].split(" ")[0]
@@ -540,16 +669,26 @@ def export_video(video_id):
         prev_date = (datetime.fromisoformat(date_str) - timedelta(days=1)).date().isoformat()
         prev_map = date_map.get(prev_date, {})
         prev_tpl = prev_map.get(time_str)
-        prev_hourly = prev_tpl[3] if prev_tpl else None
+        if prev_tpl is None:
+            prev_tpl = find_closest_tpl(prev_map, time_str, tolerance_seconds=10)
         prev_gain24 = prev_tpl[4] if prev_tpl else None
-
-        pct = None
-        if prev_hourly not in (None, 0):
-            pct = round(((hourly or 0) - prev_hourly) / prev_hourly * 100, 2)
 
         pct24 = None
         if prev_gain24 not in (None, 0):
-            pct24 = round(((gain24 or 0) - prev_gain24) / prev_gain24 * 100, 2)
+            try:
+                pct24 = round(((gain24 or 0) - prev_gain24) / prev_gain24 * 100, 2)
+            except Exception:
+                pct24 = None
+
+        # projection for export (same logic as in index)
+        proj_remaining = None
+        proj_eod = None
+        if pct24 is not None:
+            m = 1.0 + (pct24 / 100.0)
+            sum_prev_remaining = sum_prev_day_remaining_gains(date_map, prev_date, time_str, tolerance_seconds=10)
+            if sum_prev_remaining > 0:
+                proj_remaining = int(round(sum_prev_remaining * m))
+                proj_eod = (views or 0) + proj_remaining
 
         rows_for_df.append({
             "Time (IST)": ts,
@@ -557,13 +696,14 @@ def export_video(video_id):
             "Gain (5 min)": gain5 if gain5 is not None else "",
             "Hourly Growth": hourly if hourly is not None else "",
             "Gain (24 h)": gain24 if gain24 is not None else "",
-            "Change vs prev day (%)": pct if pct is not None else "",
-            "Change 24h vs prev day (%)": pct24 if pct24 is not None else ""
+            "Change 24h vs prev day (%)": pct24 if pct24 is not None else "",
+            "Proj add (24h method)": proj_remaining if proj_remaining is not None else "",
+            "Projected EOD": proj_eod if proj_eod is not None else ""
         })
 
     df_views = pd.DataFrame(rows_for_df)
 
-    # targets sheet
+    # Build targets sheet data
     nowu = now_utc()
     targets_rows_for_df = []
     for t in target_rows:
@@ -571,6 +711,7 @@ def export_video(video_id):
         t_views = t["target_views"]
         t_ts = t["target_ts"]
         note = t["note"]
+        # compute required figures similar to index()
         latest_views = processed[-1][1] if processed else None
         remaining_views = t_views - (latest_views or 0)
         remaining_seconds = (t_ts - nowu).total_seconds()
