@@ -1,1 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>YouTube Tracker — Home</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background:#ffffff; color:#0a0a0a; }
+    .card-thumb { border:1px solid #e6e6e6; border-radius:.5rem; overflow:hidden; transition:box-shadow .12s ease; }
+    .card-thumb:hover { box-shadow:0 6px 18px rgba(0,0,0,.06); }
+    .thumb-img { width:100%; height:140px; object-fit:cover; display:block; background:#f2f2f2; }
+    .card-title { font-size:0.95rem; margin:0; line-height:1.25; }
+    .muted { color:#6c757d; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:1rem; }
+    .short-id { font-size:.78rem; color:#6c757d; }
+    a.no-decor { text-decoration:none; color:inherit; }
+  </style>
+</head>
+<body>
+<div class="container py-4">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h1 class="mb-0">📺 YouTube Tracker</h1>
+    <a class="btn btn-outline-secondary" href="{{ url_for('home') }}">Home</a>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="mb-3">
+        {% for category, message in messages %}
+          <div class="alert alert-{{ 'secondary' if category=='info' else category }} alert-dismissible fade show" role="alert">
+            {{ message }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  <div class="card mb-4">
+    <div class="card-body">
+      <form class="row g-2" method="POST" action="{{ url_for('add_video') }}">
+        <div class="col-12 col-md-9">
+          <input class="form-control" type="url" name="link" placeholder="Paste YouTube link (youtube.com or youtu.be)" required>
+        </div>
+        <div class="col-12 col-md-3 d-grid">
+          <button class="btn btn-primary" type="submit">Add & Start Tracking</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <h5 class="mb-2">Tracked videos</h5>
+
+  {% if videos|length == 0 %}
+    <p class="muted">No videos being tracked yet — add one using the form above.</p>
+  {% else %}
+    <div class="grid">
+      {% for v in videos %}
+        <div class="card-thumb">
+          <a class="no-decor" href="{{ url_for('video_detail', video_id=v.video_id) }}">
+            <img class="thumb-img" src="{{ v.thumbnail }}" alt="thumbnail for {{ v.short_title }}">
+            <div style="padding:.6rem;">
+              <div class="card-title">{{ v.short_title }}</div>
+              <div class="d-flex justify-content-between align-items-center mt-1">
+                <div class="short-id">{{ v.video_id }}</div>
+                <div class="muted small">
+                  {% if v.is_tracking %}
+                    <span class="badge bg-success">tracking</span>
+                  {% else %}
+                    <span class="badge bg-secondary">paused</span>
+                  {% endif %}
+                </div>
+              </div>
+            </div>
+          </a>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <footer class="mt-4 muted text-center">Stored in PostgreSQL • UTC in DB, shown in IST</footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
 
