@@ -1,1 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ v.name }} — Video</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    :root{
+      --accent-blue:#e9f3ff;
+      --accent-green:#e9f9f0;
+      --accent-red:#ffecec;
+      --text-dark:#0a0a0a;
+      --muted:#5b5b5b;
+      --border:#e6e6e6;
+    }
+    body{ background:#fff; color:var(--text-dark); }
+    .card{ background:#fff; border:1px solid var(--border); }
+    .badge.paused{ background:#adb5bd; }
+    .gain-pos{ background:var(--accent-green); padding:.1rem .4rem; border-radius:.25rem; display:inline-block;}
+    .gain-neg{ background:var(--accent-red); padding:.1rem .4rem; border-radius:.25rem; display:inline-block;}
+    .gain-null{ color:var(--muted); }
+    .muted{ color:var(--muted); }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace; }
+    .target-card{ background:#f8f9fa; border:1px solid var(--border); border-radius:.5rem; padding:.5rem .75rem; margin-bottom:.5rem; }
+    .small-note { font-size:.86rem; color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="container py-4">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <div class="d-flex gap-3 align-items-center">
+      <a href="{{ url_for('home') }}" class="btn btn-outline-secondary btn-sm">← Home</a>
+      <img src="{{ v.thumbnail }}" alt="thumb" style="width:96px;height:54px;object-fit:cover;border-radius:.25rem;">
+      <div>
+        <h4 class="mb-0">{{ v.name }}</h4>
+        <small class="muted">Video ID: {{ v.video_id }}</small>
+      </div>
+    </div>
+    <div class="d-flex gap-2">
+      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('export_video', video_id=v.video_id) }}">Export</a>
+      <a class="btn btn-sm btn-outline-warning" href="{{ url_for('stop_tracking', video_id=v.video_id) }}">
+        {% if v.is_tracking %}Pause{% else %}Resume{% endif %}
+      </a>
+      <a class="btn btn-sm btn-outline-danger" href="{{ url_for('remove_video', video_id=v.video_id) }}" onclick="return confirm('Delete this video and ALL its data?')">Remove</a>
+    </div>
+  </div>
+
+  <!-- Targets -->
+  <div class="mb-3">
+    <h6 class="mb-2">🎯 Targets</h6>
+    {% if v.targets|length == 0 %}
+      <p class="muted mb-2">No targets yet. Add one below.</p>
+    {% else %}
+      {% for t in v.targets %}
+        <div class="target-card d-flex justify-content-between align-items-center">
+          <div>
+            <strong>{{ "{:,}".format(t.target_views) }}</strong>
+            <small class="muted">by {{ t.target_ts_ist }}</small>
+            {% if t.note %}<div class="muted small">{{ t.note }}</div>{% endif %}
+          </div>
+          <div class="text-end">
+            {% if t.status == 'reached' %}
+              <div class="badge bg-success">Reached</div>
+            {% elif t.status == 'overdue' %}
+              <div class="badge bg-danger">Overdue</div>
+            {% else %}
+              <div class="muted small">Remaining: {{ "{:,}".format(t.remaining_views) }}</div>
+              <div class="mono">Req/hr: {{ "{:,}".format(t.required_per_hour) }} • 5min: {{ "{:,}".format(t.required_per_5min) }}</div>
+            {% endif %}
+            <div class="mt-1">
+              <a class="btn btn-sm btn-outline-danger" href="{{ url_for('remove_target', target_id=t.id) }}" onclick="return confirm('Remove this target?')">Remove</a>
+            </div>
+          </div>
+        </div>
+      {% endfor %}
+    {% endif %}
+
+    <!-- Add Target Form -->
+    <form class="row g-2" method="POST" action="{{ url_for('add_target', video_id=v.video_id) }}">
+      <div class="col-12 col-md-3">
+        <input class="form-control" name="target_views" type="number" min="1" placeholder="Target views" required>
+      </div>
+      <div class="col-12 col-md-4">
+        <input class="form-control" name="target_ts" type="datetime-local" required>
+      </div>
+      <div class="col-12 col-md-4">
+        <input class="form-control" name="note" placeholder="Optional note (e.g. campaign end)" maxlength="200">
+      </div>
+      <div class="col-12 col-md-1 d-grid">
+        <button class="btn btn-primary btn-sm" type="submit">Add</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Data tables -->
+  {% if v.daily|length == 0 %}
+    <p class="muted">No samples yet. First snapshot will appear after next tick.</p>
+  {% else %}
+    {% for d, rows in v.daily.items() %}
+      <div class="card mb-3">
+        <div class="card-body">
+          <h6 class="mb-2">{{ d }}</h6>
+          <div class="table-responsive">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr>
+                  <th>Time (IST)</th>
+                  <th>Total Views</th>
+                  <th>Gain (5 min)</th>
+                  <th>Hourly Growth</th>
+                  <th>24h Gain ⓘ</th>
+                  <th>Change 24h vs prev day (%)</th>
+                  <th>Projected (min) views (based on exact yesterday 22:30)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for ts, views, gain, hourly, gain24, pct24, projected in rows %}
+                  <tr>
+                    <td class="mono">{{ ts }}</td>
+                    <td class="mono">{{ "{:,}".format(views) }}</td>
+                    <td>
+                      {% if gain is none %}<span class="gain-null">—</span>
+                      {% elif gain >= 0 %}<span class="gain-pos">+{{ "{:,}".format(gain) }}</span>
+                      {% else %}<span class="gain-neg">{{ "{:,}".format(gain) }}</span>{% endif %}
+                    </td>
+                    <td>
+                      {% if hourly is none %}<span class="gain-null">—</span>
+                      {% elif hourly >= 0 %}<span class="gain-pos">+{{ "{:,}".format(hourly) }}</span>
+                      {% else %}<span class="gain-neg">{{ "{:,}".format(hourly) }}</span>{% endif %}
+                    </td>
+                    <td>
+                      {% if gain24 is none %}<span class="gain-null">—</span>
+                      {% elif gain24 >= 0 %}<span class="gain-pos">+{{ "{:,}".format(gain24) }}</span>
+                      {% else %}<span class="gain-neg">{{ "{:,}".format(gain24) }}</span>{% endif %}
+                    </td>
+                    <td>
+                      {% if pct24 is none %}<span class="gain-null">—</span>
+                      {% elif pct24 > 0 %}<span class="gain-pos">+{{ ('{:.2f}'.format(pct24)) }}%</span>
+                      {% elif pct24 < 0 %}<span class="gain-neg">{{ ('{:.2f}'.format(pct24)) }}%</span>
+                      {% else %}<span>0.00%</span>{% endif %}
+                    </td>
+                    <td>
+                      {% if projected is none %}<span class="gain-null">—</span>
+                      {% else %}<span class="mono">{{ "{:,}".format(projected) }}</span>{% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  {% endif %}
+
+  <footer class="mt-4 mb-3 text-center muted">Stored in PostgreSQL • UTC in DB, shown in IST</footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
 
