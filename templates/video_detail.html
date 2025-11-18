@@ -59,6 +59,21 @@
     }
     .live-sub { display:block; font-size:.85rem; color:var(--muted); margin-top:.18rem; }
 
+    /* Channel badge */
+    .channel-badge {
+      display:flex;
+      gap:.6rem;
+      align-items:center;
+      margin-top:.6rem;
+      padding:.35rem .6rem;
+      border-radius:.45rem;
+      background:#fff;
+      border:1px solid var(--border);
+      font-size:.95rem;
+      white-space:nowrap;
+    }
+    .channel-badge .val { font-weight:600; font-family: ui-monospace, monospace; }
+
     /* Action buttons layout */
     .action-row { display:flex; gap:.5rem; flex-wrap:wrap; }
     .action-row .btn { min-width:120px; flex:1 1 auto; }
@@ -98,8 +113,8 @@
       <div class="video-title">{{ v.name }}</div>
       <div class="small-note">Video ID: <span class="mono">{{ v.video_id }}</span></div>
 
-      <!-- LIVE / Updated badge (uses v.latest_ts_iso and v.latest_views provided by backend) -->
-      <div id="liveBadgeWrap">
+      <!-- LIVE / Updated badge (video samples) -->
+      <div id="liveBadgeWrap" class="mt-2">
         {% if v.latest_ts_iso and v.latest_views is not none %}
           <div class="live-badge" id="liveBadge" data-latest-iso="{{ v.latest_ts_iso }}" data-views="{{ v.latest_views|int }}">
             <span class="dot" aria-hidden="true"></span>
@@ -109,8 +124,40 @@
         {% else %}
           <div class="small-note">No samples yet.</div>
         {% endif %}
-        {% if v.channel_total_views is not none %}
-          <div class="small-note mt-1">Channel total views (now): <strong class="mono">{{ "{:,}".format(v.channel_total_views) }}</strong></div>
+      </div>
+
+      <!-- CHANNEL badge: shows latest channel total, gain since prev snapshot, gain 24h -->
+      <div class="channel-badge" aria-hidden="false" title="Channel total & gains">
+        {% set c = v.channel_info %}
+        {% if c.channel_total is not none %}
+          <div>Channel:</div>
+          <div class="val">{{ "{:,}".format(c.channel_total) }}</div>
+          <div class="muted">·</div>
+          <div>
+            {% if c.channel_gain_since_prev is none %}
+              <span class="muted">since last: —</span>
+            {% else %}
+              {% if c.channel_gain_since_prev >= 0 %}
+                <span class="gain-pos">+{{ "{:,}".format(c.channel_gain_since_prev) }} since last</span>
+              {% else %}
+                <span class="gain-neg">{{ "{:,}".format(c.channel_gain_since_prev) }} since last</span>
+              {% endif %}
+            {% endif %}
+          </div>
+          <div class="muted">·</div>
+          <div>
+            {% if c.channel_gain_24h is none %}
+              <span class="muted">24h: —</span>
+            {% else %}
+              {% if c.channel_gain_24h >= 0 %}
+                <span class="gain-pos">+{{ "{:,}".format(c.channel_gain_24h) }} (24h)</span>
+              {% else %}
+                <span class="gain-neg">{{ "{:,}".format(c.channel_gain_24h) }} (24h)</span>
+              {% endif %}
+            {% endif %}
+          </div>
+        {% else %}
+          <div class="muted">Channel stats not available</div>
         {% endif %}
       </div>
     </div>
@@ -126,7 +173,7 @@
   </div>
 
   <div class="content-wrap">
-    <!-- Targets (same as before) -->
+    <!-- Targets -->
     <div class="mt-4">
       <h6 class="mb-2">🎯 Targets</h6>
       {% if v.targets|length == 0 %}
@@ -178,16 +225,19 @@
     <!-- Date selector row -->
     <div class="mt-3 date-row">
       <button id="prevDayBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Previous day">◀ Prev</button>
+
       <select id="dateSelect" class="form-select form-select-sm date-select" aria-label="Select date">
         {% for d in v.daily.keys() %}
           <option value="{{ d }}">{{ d }}</option>
         {% endfor %}
       </select>
+
       <button id="nextDayBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Next day">Next ▶</button>
+
       <div class="ms-auto small-note">Showing: <span id="showingDate"></span></div>
     </div>
 
-    <!-- Data tables -->
+    <!-- Data tables (each day wrapped in .day-block) -->
     <div id="daysContainer">
       {% for d, rows in v.daily.items() %}
         <div class="day-block" data-date="{{ d }}">
@@ -205,7 +255,6 @@
                       <th>24h Gain ⓘ</th>
                       <th>Change 24h vs prev day (%)</th>
                       <th>Projected (min) views</th>
-                      <th>Channel total views (now)</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -237,10 +286,6 @@
                         <td>
                           {% if projected is none %}<span class="gain-null">—</span>
                           {% else %}<span class="mono">{{ "{:,}".format(projected) }}</span>{% endif %}
-                        </td>
-                        <td class="mono">
-                          {% if v.channel_total_views is none %}<span class="gain-null">—</span>
-                          {% else %}{{ "{:,}".format(v.channel_total_views) }}{% endif %}
                         </td>
                       </tr>
                     {% endfor %}
