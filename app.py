@@ -1,4 +1,4 @@
-# app.py — Two-page YouTube tracker with Projected (min) views (exact yesterday 22:30)
+# app.py — Two-page YouTube tracker with cached channel totals using YOUTUBE.channels().list(...)
 import os
 import threading
 import logging
@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 import pandas as pd
 from flask import (
@@ -31,13 +31,16 @@ log = logging.getLogger("yt-tracker")
 IST = ZoneInfo("Asia/Kolkata")
 
 # -----------------------------
-# Env
+# Env & cache TTL
 # -----------------------------
 API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 POSTGRES_URL = os.getenv("DATABASE_URL")
+CHANNEL_CACHE_TTL = int(os.getenv("CHANNEL_CACHE_TTL", "60"))  # seconds
+
 if not POSTGRES_URL:
     log.warning("DATABASE_URL not set.")
 
+# YouTube client
 YOUTUBE = None
 if API_KEY:
     try:
@@ -46,12 +49,46 @@ if API_KEY:
     except Exception as e:
         log.exception("YouTube init failed: %s", e)
 
+# In-memory cache for channel totals: channel_id -> (value:int, fetched_at:float)
+_channel_views_cache: Dict[str, Tuple[Optional[int], float]] = {}
+_channel_cache_lock = threading.Lock()
+
+def get_channel_total_cached(channel_id: str) -> Optional[int]:
+    """
+    Return channel total views using cached value if fresh; otherwise query YOUTUBE.channels().
+    """
+    if not channel_id:
+        return None
+    now = time.time()
+    with _channel_cache_lock:
+        entry = _channel_views_cache.get(channel_id)
+        if entry:
+            val, fetched_at = entry
+            if now - fetched_at <= CHANNEL_CACHE_TTL:
+                return val
+    # not cached or stale -> fetch
+    if not YOUTUBE:
+        return None
+    try:
+        resp = YOUTUBE.channels().list(part="statistics", id=channel_id, maxResults=1).execute()
+        items = resp.get("items", [])
+        if not items:
+            val = None
+        else:
+            stats = items[0].get("statistics", {})
+            val = int(stats.get("viewCount", 0))
+    except Exception as e:
+        log.exception("Error fetching channel stats for %s: %s", channel_id, e)
+        val = None
+    with _channel_cache_lock:
+        _channel_views_cache[channel_id] = (val, now)
+    return val
+
 # -----------------------------
 # DB connection (psycopg3)
 # -----------------------------
 _db = None
 _db_lock = threading.Lock()
-
 
 def db():
     global _db
@@ -68,9 +105,7 @@ def db():
             )
         return _db
 
-
 def init_db():
-    """Schema: store timestamps in UTC (timestamptz). Compute IST date on insert."""
     conn = db()
     with conn.cursor() as cur:
         cur.execute("""
@@ -102,7 +137,6 @@ def init_db():
         """)
     log.info("DB schema ready.")
 
-
 # -----------------------------
 # YouTube helpers
 # -----------------------------
@@ -123,7 +157,6 @@ def extract_video_id(link: str) -> str | None:
     except Exception:
         return None
 
-
 def fetch_title(video_id: str) -> str:
     if not YOUTUBE:
         return "Unknown"
@@ -131,13 +164,29 @@ def fetch_title(video_id: str) -> str:
         r = YOUTUBE.videos().list(part="snippet", id=video_id, maxResults=1).execute()
         items = r.get("items", [])
         return (items[0]["snippet"]["title"] if items else "Unknown")[:140] or "Unknown"
-    except HttpError as e:
-        log.error("YouTube (title) %s: %s", video_id, e)
-        return "Unknown"
     except Exception as e:
         log.exception("Title fetch error: %s", e)
         return "Unknown"
 
+def fetch_channel_id_for_videos(video_ids: list[str]) -> dict:
+    """
+    Bulk fetch snippet.channelId for up to 50 video_ids.
+    Returns mapping video_id -> channel_id (may be missing for some).
+    """
+    out: dict = {}
+    if not YOUTUBE or not video_ids:
+        return out
+    try:
+        for i in range(0, len(video_ids), 50):
+            chunk = video_ids[i:i+50]
+            r = YOUTUBE.videos().list(part="snippet", id=",".join(chunk), maxResults=50).execute()
+            for it in r.get("items", []):
+                vid = it["id"]
+                ch = it.get("snippet", {}).get("channelId")
+                out[vid] = ch
+    except Exception as e:
+        log.exception("fetch_channel_id_for_videos error: %s", e)
+    return out
 
 def fetch_stats_batch(video_ids: list[str]) -> dict:
     if not YOUTUBE or not video_ids:
@@ -160,13 +209,11 @@ def fetch_stats_batch(video_ids: list[str]) -> dict:
         log.exception("Stats fetch error: %s", e)
     return out
 
-
 # -----------------------------
 # Storage helpers
 # -----------------------------
 def now_utc():
     return datetime.now(timezone.utc).replace(microsecond=0)
-
 
 def safe_store(video_id: str, stats: dict):
     tsu = now_utc()
@@ -179,26 +226,17 @@ def safe_store(video_id: str, stats: dict):
             (video_id, tsu, date_ist, int(stats.get("views", 0)), stats.get("likes"))
         )
 
-
 def interpolate_views_at(rows_asc: list[dict], target_ts: datetime) -> Optional[float]:
-    """
-    Return interpolated views at target_ts (tz-aware). If exact match exists return that value.
-    If target_ts < first ts or > last ts return None.
-    Interpolation between bracketing samples (linear in time).
-    """
     if not rows_asc:
         return None
-    # exact match
     for r in rows_asc:
         if r["ts_utc"] == target_ts:
             return float(r["views"])
-    # find bracketing indices
     prev = None
     for r in rows_asc:
         if r["ts_utc"] < target_ts:
             prev = r
             continue
-        # r.ts_utc >= target_ts
         if r["ts_utc"] > target_ts and prev is not None:
             t0 = prev["ts_utc"].timestamp()
             v0 = float(prev["views"])
@@ -208,24 +246,15 @@ def interpolate_views_at(rows_asc: list[dict], target_ts: datetime) -> Optional[
                 return v1
             frac = (target_ts.timestamp() - t0) / (t1 - t0)
             return v0 + frac * (v1 - v0)
-        # prev is None and r.ts_utc >= target_ts -> target before first sample
         if prev is None:
             return None
-    # target after last sample -> None
     return None
-
 
 def _time_to_seconds(time_str: str) -> int:
     h, m, s = [int(x) for x in time_str.split(":")]
     return h * 3600 + m * 60 + s
 
-
 def find_closest_tpl(prev_map: dict, time_part: str, tolerance_seconds: int = 10):
-    """
-    prev_map: mapping time_str -> tpl
-    time_part: 'HH:MM:SS' string to match
-    returns tpl with minimal abs(second-diff) if within tolerance, else None
-    """
     if not prev_map:
         return None
     target_secs = _time_to_seconds(time_part)
@@ -244,22 +273,13 @@ def find_closest_tpl(prev_map: dict, time_part: str, tolerance_seconds: int = 10
         return best
     return None
 
-
 def process_gains(rows_asc: list[dict]):
-    """
-    Input: rows ascending by ts_utc.
-    Output: list of tuples:
-      (ts_ist_str, views, gain_5min, hourly_gain, gain_24h)
-    24h gain uses interpolation when possible, otherwise falls back to latest <= target.
-    """
     out = []
     for i, r in enumerate(rows_asc):
         ts_utc = r["ts_utc"]
         ts_ist = ts_utc.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
         views = r["views"]
         gain = None if i == 0 else views - rows_asc[i - 1]["views"]
-
-        # hourly: latest row <= ts - 1h
         target_h = ts_utc - timedelta(hours=1)
         ref_idx_h = None
         for j in range(i, -1, -1):
@@ -267,8 +287,6 @@ def process_gains(rows_asc: list[dict]):
                 ref_idx_h = j
                 break
         hourly = None if ref_idx_h is None else (views - rows_asc[ref_idx_h]["views"])
-
-        # 24h: try interpolation first, fallback to latest <= target
         target_d = ts_utc - timedelta(days=1)
         interp = interpolate_views_at(rows_asc, target_d)
         if interp is None:
@@ -280,17 +298,14 @@ def process_gains(rows_asc: list[dict]):
             gain_24h = None if ref_idx_d is None else (views - rows_asc[ref_idx_d]["views"])
         else:
             gain_24h = views - int(round(interp))
-
         out.append((ts_ist, views, gain, hourly, gain_24h))
     return out
-
 
 # -----------------------------
 # Background sampler
 # -----------------------------
 _sampler_started = False
 _sampler_lock = threading.Lock()
-
 
 def sleep_until_next_5min_IST():
     now_ist = datetime.now(IST).replace(microsecond=0)
@@ -300,7 +315,6 @@ def sleep_until_next_5min_IST():
     else:
         next_tick = now_ist.replace(minute=next_min, second=0)
     time.sleep(max(1, (next_tick - now_ist).total_seconds()))
-
 
 def sampler_loop():
     log.info("Sampler loop started (aligned to IST 5-min).")
@@ -322,7 +336,6 @@ def sampler_loop():
             log.exception("Sampler error: %s", e)
             time.sleep(5)
 
-
 def start_background():
     global _sampler_started
     with _sampler_lock:
@@ -332,17 +345,10 @@ def start_background():
             _sampler_started = True
             log.info("Background sampler started.")
 
-
 # -----------------------------
 # Helper: build display data for one video (used by detail & export)
 # -----------------------------
 def build_video_display(vid: str):
-    """
-    Returns dict used by the video detail page:
-      - video_id, name, is_tracking, latest_views, latest_ts
-      - daily: {date_str: [ (ts, views, gain5, hourly, gain24, pct24, projected), ... ] } (newest-first)
-      - targets list
-    """
     conn = db()
     with conn.cursor() as cur:
         cur.execute("SELECT video_id, name, is_tracking FROM video_list WHERE video_id=%s", (vid,))
@@ -364,32 +370,26 @@ def build_video_display(vid: str):
                 date_str, time_part = ts_ist.split(" ")
                 grouped.setdefault(date_str, []).append(tpl)
                 date_time_map.setdefault(date_str, {})[time_part] = tpl
-
             dates_sorted = sorted(grouped.keys(), reverse=True)
             daily = {}
             for date_str in dates_sorted:
                 processed = grouped[date_str]
                 prev_date_str = (datetime.fromisoformat(date_str).date() - timedelta(days=1)).isoformat()
                 prev_map = date_time_map.get(prev_date_str, {})
-
                 display_rows = []
                 for tpl in processed:
                     ts_ist, views, gain_5min, hourly_gain, gain_24h = tpl
                     time_part = ts_ist.split(" ")[1]
-
                     prev_tpl_for_pct = prev_map.get(time_part)
                     if prev_tpl_for_pct is None:
                         prev_tpl_for_pct = find_closest_tpl(prev_map, time_part, tolerance_seconds=10)
                     prev_gain24_for_pct = prev_tpl_for_pct[4] if prev_tpl_for_pct else None
-
                     pct24 = None
                     if prev_gain24_for_pct not in (None, 0):
                         try:
                             pct24 = round(((gain_24h or 0) - prev_gain24_for_pct) / prev_gain24_for_pct * 100, 2)
                         except Exception:
                             pct24 = None
-
-                    # exact yesterday 22:30 lookup for projection
                     projected = None
                     prev_2230_tpl = prev_map.get("22:30:00")
                     if prev_2230_tpl is not None and pct24 not in (None,):
@@ -401,10 +401,7 @@ def build_video_display(vid: str):
                                 projected = int(round(projected_val))
                             except Exception:
                                 projected = None
-
                     display_rows.append((ts_ist, views, gain_5min, hourly_gain, gain_24h, pct24, projected))
-
-                # newest-first
                 daily[date_str] = list(reversed(display_rows))
 
         latest_views = None
@@ -413,7 +410,17 @@ def build_video_display(vid: str):
             latest_views = all_rows[-1]["views"]
             latest_ts = all_rows[-1]["ts_utc"]
 
-        # targets
+        latest_ts_iso = latest_ts.isoformat() if latest_ts is not None else None
+        latest_ts_ist = latest_ts.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S") if latest_ts is not None else None
+
+        # get channel total using cached helper (need channel id -> fetch via videos().list single call)
+        channel_total_views = None
+        if YOUTUBE:
+            ch_map = fetch_channel_id_for_videos([vid])
+            channel_id = ch_map.get(vid)
+            if channel_id:
+                channel_total_views = get_channel_total_cached(channel_id)
+
         cur.execute("SELECT id, target_views, target_ts, note FROM targets WHERE video_id=%s ORDER BY target_ts ASC", (vid,))
         target_rows = cur.fetchall()
         nowu = now_utc()
@@ -453,9 +460,11 @@ def build_video_display(vid: str):
         "daily": daily,
         "targets": targets_display,
         "latest_views": latest_views,
-        "latest_ts": latest_ts
+        "latest_ts": latest_ts,
+        "latest_ts_iso": latest_ts_iso,
+        "latest_ts_ist": latest_ts_ist,
+        "channel_total_views": channel_total_views
     }
-
 
 # -----------------------------
 # Routes (two-page site)
@@ -464,27 +473,39 @@ def build_video_display(vid: str):
 def healthz():
     return "ok", 200
 
-
 @app.get("/")
 def home():
     conn = db()
     with conn.cursor() as cur:
         cur.execute("SELECT video_id, name, is_tracking FROM video_list ORDER BY name")
         videos = cur.fetchall()
+
     vids = []
+    # prepare list of video ids to bulk fetch channelIds
+    video_ids = [v["video_id"] for v in videos]
+    ch_map = fetch_channel_id_for_videos(video_ids) if YOUTUBE and video_ids else {}
+
+    # build unique channel id set and pre-warm cache
+    unique_chs = sorted({ch for ch in ch_map.values() if ch})
+    for ch in unique_chs:
+        # warm cache in background: but here we'll call synchronously (fast, cached)
+        _ = get_channel_total_cached(ch)
+
     for v in videos:
         vid = v["video_id"]
         thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
         short_title = v["name"] if len(v["name"]) <= 60 else v["name"][:57] + "..."
+        channel_id = ch_map.get(vid)
+        channel_total = get_channel_total_cached(channel_id) if channel_id else None
         vids.append({
             "video_id": vid,
             "name": v["name"],
             "short_title": short_title,
             "thumbnail": thumb,
-            "is_tracking": bool(v["is_tracking"])
+            "is_tracking": bool(v["is_tracking"]),
+            "channel_total_views": channel_total
         })
     return render_template("home.html", videos=vids)
-
 
 @app.get("/video/<video_id>")
 def video_detail(video_id):
@@ -494,7 +515,6 @@ def video_detail(video_id):
         return redirect(url_for("home"))
     info["thumbnail"] = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
     return render_template("video_detail.html", v=info)
-
 
 @app.post("/add_video")
 def add_video():
@@ -524,7 +544,6 @@ def add_video():
     flash(f"Now tracking: {title}", "success")
     return redirect(url_for("video_detail", video_id=video_id))
 
-
 @app.post("/add_target/<video_id>")
 def add_target(video_id):
     tv = request.form.get("target_views", "").strip()
@@ -547,7 +566,6 @@ def add_target(video_id):
     flash("Target added.", "success")
     return redirect(url_for("video_detail", video_id=video_id))
 
-
 @app.get("/remove_target/<int:target_id>")
 def remove_target(target_id):
     conn = db()
@@ -562,7 +580,6 @@ def remove_target(target_id):
     flash("Target removed.", "info")
     return redirect(url_for("video_detail", video_id=vid))
 
-
 @app.get("/stop_tracking/<video_id>")
 def stop_tracking(video_id):
     conn = db()
@@ -576,7 +593,6 @@ def stop_tracking(video_id):
         cur.execute("UPDATE video_list SET is_tracking=%s WHERE video_id=%s", (new_state, video_id))
         flash(("Resumed" if new_state else "Paused") + f" tracking: {row['name']}", "info")
     return redirect(url_for("video_detail", video_id=video_id))
-
 
 @app.get("/remove_video/<video_id>")
 def remove_video(video_id):
@@ -593,19 +609,15 @@ def remove_video(video_id):
         flash(f"Removed '{name}' and all data.", "success")
     return redirect(url_for("home"))
 
-
 @app.get("/export/<video_id>")
 def export_video(video_id):
     info = build_video_display(video_id)
     if info is None:
         flash("Video not found.", "warning")
         return redirect(url_for("home"))
-
-    # Build DataFrame from info['daily'] (chronological ascending)
     rows_for_df = []
     dates = sorted(info["daily"].keys())
     for date in dates:
-        # info['daily'][date] is newest-first, reverse to chronological
         day_rows = list(reversed(info["daily"][date]))
         for tpl in day_rows:
             ts, views, gain5, hourly, gain24, pct24, projected = tpl
@@ -616,12 +628,10 @@ def export_video(video_id):
                 "Hourly Growth": hourly if hourly is not None else "",
                 "Gain (24 h)": gain24 if gain24 is not None else "",
                 "Change 24h vs prev day (%)": pct24 if pct24 is not None else "",
-                "Projected (min) views": projected if projected is not None else ""
+                "Projected (min) views": projected if projected is not None else "",
+                "Channel total views (now)": info["channel_total_views"] if info.get("channel_total_views") is not None else ""
             })
-
     df_views = pd.DataFrame(rows_for_df)
-
-    # targets sheet
     conn = db()
     with conn.cursor() as cur:
         cur.execute("SELECT id, target_views, target_ts, note FROM targets WHERE video_id=%s ORDER BY target_ts ASC", (video_id,))
@@ -660,14 +670,12 @@ def export_video(video_id):
             "Note": note
         })
     df_targets = pd.DataFrame(targets_rows_for_df)
-
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df_views.to_excel(writer, index=False, sheet_name="Views")
         if not df_targets.empty:
             df_targets.to_excel(writer, index=False, sheet_name="Targets")
     bio.seek(0)
-
     safe = "".join(c for c in info["name"] if c.isalnum() or c in " _-").rstrip()
     return send_file(
         bio,
@@ -675,7 +683,6 @@ def export_video(video_id):
         download_name=f"{safe or 'export'}_views.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
 
 # Bootstrap
 init_db()
