@@ -59,8 +59,8 @@
     <div class="grid">
       {% for v in videos %}
         <div class="card-thumb">
-          {% if v.channel_total_views is not none %}
-            <div class="badge-channel">{{ "{:,}".format(v.channel_total_views) }}</div>
+          {% if v.channel_total_cached is not none %}
+            <div class="badge-channel">{{ "{:,}".format(v.channel_total_cached) }}</div>
           {% endif %}
           <a class="no-decor" href="{{ url_for('video_detail', video_id=v.video_id) }}">
             <img class="thumb-img" src="{{ v.thumbnail }}" alt="thumbnail for {{ v.short_title }}">
