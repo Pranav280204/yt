@@ -1,4 +1,4 @@
-# app.py — Two-page YouTube tracker with cached channel totals using YOUTUBE.channels().list(...)
+# app.py — Tracker with channel_stats snapshots and channel-gain badge
 import os
 import threading
 import logging
@@ -35,8 +35,8 @@ IST = ZoneInfo("Asia/Kolkata")
 # -----------------------------
 API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 POSTGRES_URL = os.getenv("DATABASE_URL")
-CHANNEL_CACHE_TTL = int(os.getenv("CHANNEL_CACHE_TTL", "60"))  # seconds
-
+CHANNEL_CACHE_TTL = int(os.getenv("CHANNEL_CACHE_TTL", "50"))  # seconds; < sampler interval
+CHANNEL_REFRESH_INTERVAL = int(os.getenv("CHANNEL_REFRESH_INTERVAL", "60"))  # refresher (not used for DB writes)
 if not POSTGRES_URL:
     log.warning("DATABASE_URL not set.")
 
@@ -49,39 +49,34 @@ if API_KEY:
     except Exception as e:
         log.exception("YouTube init failed: %s", e)
 
-# In-memory cache for channel totals: channel_id -> (value:int, fetched_at:float)
+# simple in-memory cache for channel totals (to avoid bursts)
 _channel_views_cache: Dict[str, Tuple[Optional[int], float]] = {}
 _channel_cache_lock = threading.Lock()
 
 def get_channel_total_cached(channel_id: str) -> Optional[int]:
-    """
-    Return channel total views using cached value if fresh; otherwise query YOUTUBE.channels().
-    """
-    if not channel_id:
+    """Return channel viewCount using cached value if recent; otherwise fetch and update cache."""
+    if not channel_id or not YOUTUBE:
         return None
-    now = time.time()
+    now_ts = time.time()
     with _channel_cache_lock:
-        entry = _channel_views_cache.get(channel_id)
-        if entry:
-            val, fetched_at = entry
-            if now - fetched_at <= CHANNEL_CACHE_TTL:
+        ent = _channel_views_cache.get(channel_id)
+        if ent:
+            val, fetched_at = ent
+            if now_ts - fetched_at <= CHANNEL_CACHE_TTL:
                 return val
-    # not cached or stale -> fetch
-    if not YOUTUBE:
-        return None
+    # fetch fresh
     try:
         resp = YOUTUBE.channels().list(part="statistics", id=channel_id, maxResults=1).execute()
         items = resp.get("items", [])
         if not items:
             val = None
         else:
-            stats = items[0].get("statistics", {})
-            val = int(stats.get("viewCount", 0))
+            val = int(items[0].get("statistics", {}).get("viewCount", 0))
     except Exception as e:
         log.exception("Error fetching channel stats for %s: %s", channel_id, e)
         val = None
     with _channel_cache_lock:
-        _channel_views_cache[channel_id] = (val, now)
+        _channel_views_cache[channel_id] = (val, now_ts)
     return val
 
 # -----------------------------
@@ -135,6 +130,15 @@ def init_db():
           note         TEXT
         );
         """)
+        # channel stats table to store snapshots (ts aligned to sampler time)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS channel_stats (
+          channel_id TEXT NOT NULL,
+          ts_utc TIMESTAMPTZ NOT NULL,
+          total_views BIGINT,
+          PRIMARY KEY (channel_id, ts_utc)
+        );
+        """)
     log.info("DB schema ready.")
 
 # -----------------------------
@@ -169,10 +173,7 @@ def fetch_title(video_id: str) -> str:
         return "Unknown"
 
 def fetch_channel_id_for_videos(video_ids: list[str]) -> dict:
-    """
-    Bulk fetch snippet.channelId for up to 50 video_ids.
-    Returns mapping video_id -> channel_id (may be missing for some).
-    """
+    """Bulk fetch snippet.channelId for up to 50 video_ids."""
     out: dict = {}
     if not YOUTUBE or not video_ids:
         return out
@@ -226,22 +227,27 @@ def safe_store(video_id: str, stats: dict):
             (video_id, tsu, date_ist, int(stats.get("views", 0)), stats.get("likes"))
         )
 
-def interpolate_views_at(rows_asc: list[dict], target_ts: datetime) -> Optional[float]:
-    if not rows_asc:
+def interpolate_at(rows: list[dict], target_ts: datetime, key="views") -> Optional[float]:
+    """
+    Interpolate numeric value at target_ts from chronological rows (with ts_utc and key).
+    Returns None if target is before first or after last row.
+    """
+    if not rows:
         return None
-    for r in rows_asc:
+    # exact
+    for r in rows:
         if r["ts_utc"] == target_ts:
-            return float(r["views"])
+            return float(r[key] if key in r else r["views"])
     prev = None
-    for r in rows_asc:
+    for r in rows:
         if r["ts_utc"] < target_ts:
             prev = r
             continue
         if r["ts_utc"] > target_ts and prev is not None:
             t0 = prev["ts_utc"].timestamp()
-            v0 = float(prev["views"])
+            v0 = float(prev[key] if key in prev else prev["views"])
             t1 = r["ts_utc"].timestamp()
-            v1 = float(r["views"])
+            v1 = float(r[key] if key in r else r["views"])
             if t1 == t0:
                 return v1
             frac = (target_ts.timestamp() - t0) / (t1 - t0)
@@ -288,7 +294,7 @@ def process_gains(rows_asc: list[dict]):
                 break
         hourly = None if ref_idx_h is None else (views - rows_asc[ref_idx_h]["views"])
         target_d = ts_utc - timedelta(days=1)
-        interp = interpolate_views_at(rows_asc, target_d)
+        interp = interpolate_at(rows_asc, target_d)
         if interp is None:
             ref_idx_d = None
             for j in range(i, -1, -1):
@@ -302,7 +308,7 @@ def process_gains(rows_asc: list[dict]):
     return out
 
 # -----------------------------
-# Background sampler
+# Background sampler + channel snapshots
 # -----------------------------
 _sampler_started = False
 _sampler_lock = threading.Lock()
@@ -317,21 +323,53 @@ def sleep_until_next_5min_IST():
     time.sleep(max(1, (next_tick - now_ist).total_seconds()))
 
 def sampler_loop():
+    """
+    Every 5-min tick:
+      - fetch stats for tracked videos and store into views
+      - fetch channel ids for those videos, get channel totals (cached fetch) and insert into channel_stats
+    """
     log.info("Sampler loop started (aligned to IST 5-min).")
     while True:
         try:
             sleep_until_next_5min_IST()
+            tsu = now_utc()
             conn = db()
             with conn.cursor() as cur:
                 cur.execute("SELECT video_id FROM video_list WHERE is_tracking=TRUE ORDER BY video_id")
                 vids = [r["video_id"] for r in cur.fetchall()]
+
             if not vids:
                 continue
+
             stats_map = fetch_stats_batch(vids)
+            # store per-video stats
             for vid in vids:
                 st = stats_map.get(vid)
                 if st:
                     safe_store(vid, st)
+
+            # now handle channel snapshots
+            if YOUTUBE:
+                ch_map = fetch_channel_id_for_videos(vids)
+                unique_chs = {ch for ch in ch_map.values() if ch}
+                # fetch totals (uses caching helper)
+                ch_totals = {}
+                for ch in unique_chs:
+                    try:
+                        total = get_channel_total_cached(ch)
+                        ch_totals[ch] = total
+                    except Exception:
+                        ch_totals[ch] = None
+                # insert into channel_stats for each channel (tsu)
+                with conn.cursor() as cur:
+                    for ch, total in ch_totals.items():
+                        try:
+                            cur.execute(
+                                "INSERT INTO channel_stats (channel_id, ts_utc, total_views) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                                (ch, tsu, total)
+                            )
+                        except Exception:
+                            log.exception("Insert channel_stats failed for %s", ch)
         except Exception as e:
             log.exception("Sampler error: %s", e)
             time.sleep(5)
@@ -356,6 +394,7 @@ def build_video_display(vid: str):
         if not vrow:
             return None
 
+        # all video sample rows (chronological)
         cur.execute("SELECT ts_utc, views FROM views WHERE video_id=%s ORDER BY ts_utc ASC", (vid,))
         all_rows = cur.fetchall()
 
@@ -390,6 +429,7 @@ def build_video_display(vid: str):
                             pct24 = round(((gain_24h or 0) - prev_gain24_for_pct) / prev_gain24_for_pct * 100, 2)
                         except Exception:
                             pct24 = None
+                    # projection using yesterday 22:30 as before
                     projected = None
                     prev_2230_tpl = prev_map.get("22:30:00")
                     if prev_2230_tpl is not None and pct24 not in (None,):
@@ -413,14 +453,52 @@ def build_video_display(vid: str):
         latest_ts_iso = latest_ts.isoformat() if latest_ts is not None else None
         latest_ts_ist = latest_ts.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S") if latest_ts is not None else None
 
-        # get channel total using cached helper (need channel id -> fetch via videos().list single call)
-        channel_total_views = None
+        # ----- channel stats: latest snapshot, prev snapshot, 24h-ago snapshot -----
+        channel_info = {
+            "channel_id": None,
+            "channel_total": None,
+            "channel_prev_total": None,
+            "channel_gain_since_prev": None,
+            "channel_gain_24h": None
+        }
         if YOUTUBE:
+            # get channel id
             ch_map = fetch_channel_id_for_videos([vid])
-            channel_id = ch_map.get(vid)
-            if channel_id:
-                channel_total_views = get_channel_total_cached(channel_id)
+            ch = ch_map.get(vid)
+            if ch:
+                channel_info["channel_id"] = ch
+                # query channel_stats for that channel (chronological)
+                cur.execute("SELECT ts_utc, total_views FROM channel_stats WHERE channel_id=%s ORDER BY ts_utc ASC", (ch,))
+                ch_rows = cur.fetchall()  # chronological
+                if ch_rows:
+                    latest_ch = ch_rows[-1]
+                    channel_info["channel_total"] = latest_ch["total_views"]
+                    # prev snapshot (previous row)
+                    if len(ch_rows) >= 2:
+                        prev_ch = ch_rows[-2]
+                        channel_info["channel_prev_total"] = prev_ch["total_views"]
+                        if channel_info["channel_prev_total"] is not None and channel_info["channel_total"] is not None:
+                            channel_info["channel_gain_since_prev"] = channel_info["channel_total"] - channel_info["channel_prev_total"]
+                    # 24h-ago: try interpolation on ch_rows
+                    target_24 = latest_ch["ts_utc"] - timedelta(days=1)
+                    interp = interpolate_at(ch_rows, target_24, key="total_views")
+                    if interp is None:
+                        # fallback to latest <= target
+                        ref_idx = None
+                        for j in range(len(ch_rows)-1, -1, -1):
+                            if ch_rows[j]["ts_utc"] <= target_24:
+                                ref_idx = j
+                                break
+                        if ref_idx is None:
+                            ch_24 = None
+                        else:
+                            ch_24 = ch_rows[ref_idx]["total_views"]
+                    else:
+                        ch_24 = int(round(interp))
+                    if ch_24 is not None and channel_info["channel_total"] is not None:
+                        channel_info["channel_gain_24h"] = channel_info["channel_total"] - ch_24
 
+        # targets
         cur.execute("SELECT id, target_views, target_ts, note FROM targets WHERE video_id=%s ORDER BY target_ts ASC", (vid,))
         target_rows = cur.fetchall()
         nowu = now_utc()
@@ -463,7 +541,7 @@ def build_video_display(vid: str):
         "latest_ts": latest_ts,
         "latest_ts_iso": latest_ts_iso,
         "latest_ts_ist": latest_ts_ist,
-        "channel_total_views": channel_total_views
+        "channel_info": channel_info
     }
 
 # -----------------------------
@@ -481,20 +559,17 @@ def home():
         videos = cur.fetchall()
 
     vids = []
-    # prepare list of video ids to bulk fetch channelIds
     video_ids = [v["video_id"] for v in videos]
     ch_map = fetch_channel_id_for_videos(video_ids) if YOUTUBE and video_ids else {}
-
-    # build unique channel id set and pre-warm cache
+    # warm cache for unique channels
     unique_chs = sorted({ch for ch in ch_map.values() if ch})
     for ch in unique_chs:
-        # warm cache in background: but here we'll call synchronously (fast, cached)
         _ = get_channel_total_cached(ch)
-
     for v in videos:
         vid = v["video_id"]
         thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
         short_title = v["name"] if len(v["name"]) <= 60 else v["name"][:57] + "..."
+        # show channel total briefly (non-critical) on home cards: fetch cached
         channel_id = ch_map.get(vid)
         channel_total = get_channel_total_cached(channel_id) if channel_id else None
         vids.append({
@@ -503,7 +578,7 @@ def home():
             "short_title": short_title,
             "thumbnail": thumb,
             "is_tracking": bool(v["is_tracking"]),
-            "channel_total_views": channel_total
+            "channel_total_cached": channel_total
         })
     return render_template("home.html", videos=vids)
 
@@ -628,8 +703,7 @@ def export_video(video_id):
                 "Hourly Growth": hourly if hourly is not None else "",
                 "Gain (24 h)": gain24 if gain24 is not None else "",
                 "Change 24h vs prev day (%)": pct24 if pct24 is not None else "",
-                "Projected (min) views": projected if projected is not None else "",
-                "Channel total views (now)": info["channel_total_views"] if info.get("channel_total_views") is not None else ""
+                "Projected (min) views": projected if projected is not None else ""
             })
     df_views = pd.DataFrame(rows_for_df)
     conn = db()
