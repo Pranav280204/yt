@@ -41,6 +41,24 @@
 
     .video-title { font-size:1.15rem; margin-top:.6rem; margin-bottom:0.4rem; line-height:1.25; font-weight:600; }
 
+    /* Live-badge */
+    .live-badge {
+      display:inline-flex;
+      gap:.5rem;
+      align-items:center;
+      padding:.3rem .55rem;
+      border-radius:.45rem;
+      background:#f7f9fb;
+      border:1px solid var(--border);
+      margin-top:.5rem;
+      font-size:.94rem;
+      white-space:nowrap;
+    }
+    .live-badge .dot {
+      width:8px; height:8px; border-radius:50%; background:#28a745; box-shadow:0 0 6px rgba(40,167,69,.25);
+    }
+    .live-sub { display:block; font-size:.85rem; color:var(--muted); margin-top:.18rem; }
+
     /* Action buttons layout */
     .action-row { display:flex; gap:.5rem; flex-wrap:wrap; }
     .action-row .btn { min-width:120px; flex:1 1 auto; }
@@ -79,6 +97,22 @@
     <div class="mt-2">
       <div class="video-title">{{ v.name }}</div>
       <div class="small-note">Video ID: <span class="mono">{{ v.video_id }}</span></div>
+
+      <!-- LIVE / Updated badge (uses v.latest_ts_iso and v.latest_views provided by backend) -->
+      <div id="liveBadgeWrap">
+        {% if v.latest_ts_iso and v.latest_views is not none %}
+          <div class="live-badge" id="liveBadge" data-latest-iso="{{ v.latest_ts_iso }}" data-views="{{ v.latest_views|int }}">
+            <span class="dot" aria-hidden="true"></span>
+            <span id="liveText">Updated just now • {{ "{:,}".format(v.latest_views) }} views</span>
+          </div>
+          <div class="live-sub" id="liveSub">IST: {% if v.latest_ts_ist %}{{ v.latest_ts_ist }}{% else %}—{% endif %}</div>
+        {% else %}
+          <div class="small-note">No samples yet.</div>
+        {% endif %}
+        {% if v.channel_total_views is not none %}
+          <div class="small-note mt-1">Channel total views (now): <strong class="mono">{{ "{:,}".format(v.channel_total_views) }}</strong></div>
+        {% endif %}
+      </div>
     </div>
 
     <!-- Actions -->
@@ -92,8 +126,7 @@
   </div>
 
   <div class="content-wrap">
-
-    <!-- Targets -->
+    <!-- Targets (same as before) -->
     <div class="mt-4">
       <h6 class="mb-2">🎯 Targets</h6>
       {% if v.targets|length == 0 %}
@@ -145,20 +178,16 @@
     <!-- Date selector row -->
     <div class="mt-3 date-row">
       <button id="prevDayBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Previous day">◀ Prev</button>
-
       <select id="dateSelect" class="form-select form-select-sm date-select" aria-label="Select date">
-        {# build options newest-first so index 0 = newest #}
         {% for d in v.daily.keys() %}
           <option value="{{ d }}">{{ d }}</option>
         {% endfor %}
       </select>
-
       <button id="nextDayBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Next day">Next ▶</button>
-
       <div class="ms-auto small-note">Showing: <span id="showingDate"></span></div>
     </div>
 
-    <!-- Data tables (each day wrapped in .day-block) -->
+    <!-- Data tables -->
     <div id="daysContainer">
       {% for d, rows in v.daily.items() %}
         <div class="day-block" data-date="{{ d }}">
@@ -176,6 +205,7 @@
                       <th>24h Gain ⓘ</th>
                       <th>Change 24h vs prev day (%)</th>
                       <th>Projected (min) views</th>
+                      <th>Channel total views (now)</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -208,6 +238,10 @@
                           {% if projected is none %}<span class="gain-null">—</span>
                           {% else %}<span class="mono">{{ "{:,}".format(projected) }}</span>{% endif %}
                         </td>
+                        <td class="mono">
+                          {% if v.channel_total_views is none %}<span class="gain-null">—</span>
+                          {% else %}{{ "{:,}".format(v.channel_total_views) }}{% endif %}
+                        </td>
                       </tr>
                     {% endfor %}
                   </tbody>
@@ -231,30 +265,20 @@
     const nextBtn = document.getElementById('nextDayBtn');
     const showingDate = document.getElementById('showingDate');
     const dayBlocks = Array.from(document.querySelectorAll('.day-block'));
-
-    // Build a list of available dates from select options (preserves server order)
     const dates = Array.from(dateSelect.options).map(opt => opt.value);
 
     function showDate(date) {
-      // hide all
       dayBlocks.forEach(b => b.classList.remove('active'));
-      // show matching block
       const block = document.querySelector('.day-block[data-date="'+date+'"]');
       if (block) block.classList.add('active');
-      // update select & label
       dateSelect.value = date;
       showingDate.textContent = date;
-      // enable/disable nav buttons
       const idx = dates.indexOf(date);
-      prevBtn.disabled = (idx === dates.length - 1) || idx === -1; // prev = older (since list is newest-first)
+      prevBtn.disabled = (idx === dates.length - 1) || idx === -1;
       nextBtn.disabled = (idx <= 0);
     }
-
-    // initialize: prefer first option (newest)
     const initial = dateSelect.options.length ? dateSelect.options[0].value : null;
     if (initial) showDate(initial);
-
-    // handlers
     dateSelect.addEventListener('change', (e) => showDate(e.target.value));
     prevBtn.addEventListener('click', () => {
       const idx = dates.indexOf(dateSelect.value);
@@ -268,16 +292,37 @@
       const nextIdx = Math.max(0, idx - 1);
       showDate(dates[nextIdx]);
     });
-
-    // keyboard shortcuts: Left = prev, Right = next
     document.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowLeft') prevBtn.click();
       if (e.key === 'ArrowRight') nextBtn.click();
     });
-
-    // small accessibility: focus selects date text
     dateSelect.addEventListener('focus', () => dateSelect.size = Math.min(8, dates.length));
     dateSelect.addEventListener('blur', () => dateSelect.size = 1);
+  })();
+
+  // live badge updater: updates "Updated X ago • N views" every 10s
+  (function(){
+    const liveBadge = document.getElementById('liveBadge');
+    const liveText = document.getElementById('liveText');
+    if (!liveBadge || !liveText) return;
+    function timeAgoText(iso) {
+      const then = new Date(iso);
+      const now = new Date();
+      const diff = Math.floor((now - then) / 1000);
+      if (diff < 5) return 'just now';
+      if (diff < 60) return diff + 's ago';
+      if (diff < 3600) return Math.floor(diff/60) + 'm ' + (diff%60) + 's ago';
+      if (diff < 86400) return Math.floor(diff/3600) + 'h ' + Math.floor((diff%3600)/60) + 'm ago';
+      return Math.floor(diff/86400) + 'd ago';
+    }
+    function refresh() {
+      const iso = liveBadge.dataset.latestIso;
+      const views = parseInt(liveBadge.dataset.views || '0', 10);
+      const ago = timeAgoText(iso);
+      liveText.textContent = 'Updated ' + ago + ' • ' + views.toLocaleString() + ' views';
+    }
+    refresh();
+    setInterval(refresh, 10 * 1000);
   })();
 </script>
 </body>
