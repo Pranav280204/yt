@@ -4,6 +4,10 @@ gunicorn==23.0.0
 # YouTube API
 google-api-python-client==2.149.0
 authlib==1.2.0
+Flask-Login==0.7.0
+Flask-WTF==1.1.1
+WTForms==3.0.1
+
 # Data
 pandas==2.2.3
 openpyxl==3.1.5
